@@ -66,6 +66,8 @@ AReno 原生异步策略训练器：中英文合并需求与执行清单
 
 下面是我们的执行清单，依据 2026-09-13 的仓库审查整理。勾选仅表示已经有对应本地证据，不表示整项课题已验收。详细状态见 [仓库要求核对报告](./REQUIREMENTS_AUDIT.md)。
 
+2026-09-14 已进一步整理为可评审的 [完整实施方案](./IMPLEMENTATION_PLAN.md) 和 [逐项 TODO](./TODO.md)，包含任务依赖、完成条件、测试矩阵与 8 周目标排期。下面保留需求层面的阶段概览；日常执行与证据更新以 TODO 为入口。
+
 - [x] 建立本机同步基线：Qwen3-0.6B、LoRA、3 个真实 GRPO optimizer steps、checkpoint 保存与重载。证据见 [BASELINE_REPORT.md](./BASELINE_REPORT.md)。
 - [x] 完成中英文要求对照及当前代码能力核对，记录主线已有能力与缺口。
 - [ ] D1 / R2–R4：确定实验 trainer 的输入、配置与调用方式；首版复用现有 GRPO loss，为 GSPO 留出扩展点。
