@@ -1,0 +1,8 @@
+{
+  "tensor_count": 392,
+  "adapter_parameter_count": 5046272,
+  "reexport_exact": true,
+  "scored_token_count": 12,
+  "finite_logprobs": true,
+  "nonzero_lora_B_tensors": 196
+}
