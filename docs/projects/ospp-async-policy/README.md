@@ -6,12 +6,12 @@ AReno 原生异步策略训练器：OSPP 项目资料
 
 当前阶段已经完成同步 GRPO 基线和需求核对，完整异步 trainer 尚待实现。
 材料中的结果固定于各自记录日期；后续进展以实际实现和实验为准。
-后续开发按 8 周目标、另留 2 周缓冲安排；先阅读实施方案，再从 TODO 的 T01 开始。
+开发排期以 TODO v2 为准：先完成第 0 阶段（路线确认、导师对齐、申请、云机与环境预检），开工后 10 周核心任务加 2 周缓冲；路线 A 下中选公示前不开始实现。
 
 | 文档 | 内容 |
 |---|---|
 | [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) | 可供评审与交接的完整方案：范围、架构、版本与同步协议、验收、工期、资源和交付流程 |
-| [TODO.md](./TODO.md) | 16 项核心任务的依赖、执行内容、完成条件和证据要求；单独列出后续扩展 |
+| [TODO.md](./TODO.md) | v2 执行清单：第 0 阶段（申请与对齐）、16 项核心任务、12 周排期、每周固定动作、PR 时机、降级路径和状态表 |
 | [PROJECT_REQUIREMENTS.md](./PROJECT_REQUIREMENTS.md) | 官方中英文合并需求、原文、交付范围和执行清单 |
 | [REQUIREMENTS_AUDIT.md](./REQUIREMENTS_AUDIT.md) | 主线已有能力、缺口、未合并 PR 与本地协调器的边界 |
 | [BASELINE_REPORT.md](./BASELINE_REPORT.md) | Qwen3-0.6B LoRA 同步 GRPO 三步训练结果和复现参数 |
