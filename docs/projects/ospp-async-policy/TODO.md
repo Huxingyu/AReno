@@ -362,13 +362,13 @@ T02 / T03 与 T04 可交错推进。T14 即使没有测到加速，也要交付�
 | T00.6 | 计划 | | | | | | |
 | G0 | 未通过 | | | | | | |
 | T01 | 计划 | | | | | | |
-| T02 | 计划 | | | | | | |
-| T03 | 计划 | | | | | | |
-| T04 | 计划 | | | | | | |
-| T05 / G1 | 计划 | | | | | | |
-| T06 | 计划 | | | | | | |
-| T07 | 计划 | | | | | | |
-| T08a | 计划 | | | | | | |
+| T02 | 已验证 | 2026-09-14 | 2026-09-14 | 1f73e23 | `pytest tests/test_async_policy_batch_cpu.py tests/test_async_policy_equivalence_cpu.py` | [证据](./evidence/g1-cpu-closed-loop.md) | 与同步 `_materialize_train_batch` 逐字段一致 |
+| T03 | 已验证 | 2026-09-14 | 2026-09-14 | 1f73e23 | `pytest tests/test_async_policy_batch_cpu.py` | [证据](./evidence/g1-cpu-closed-loop.md) | Q/K 边界、drain/EOF、abort、错误穿透 |
+| T04 | 已验证 | 2026-09-14 | 2026-09-14 | 1f73e23 | `pytest tests/test_async_policy_coordinator_cpu.py` | [证据](./evidence/g1-cpu-closed-loop.md) | 修复 pending-sync 饥饿；4 线程压力回归 |
+| T05 / G1 | CPU 闭环已验证（G1 待评审） | 2026-09-14 | 2026-09-14 | 1f73e23, ca97cad | `pytest tests/test_async_policy_pipeline_cpu.py` | [证据](./evidence/g1-cpu-closed-loop.md) | 真实线程/队列；时间线证明重叠；G1 评审点未确认 |
+| T06 | 部分：fake 集成通过 | 2026-09-14 | 2026-09-14 | ca97cad | `pytest tests/test_async_policy_bridge_cpu.py` | [证据](./evidence/g1-cpu-closed-loop.md) | 真实 CUDA backend 未接，A07 未取得 |
+| T07 | 部分：stepped/版本协议通过 | 2026-09-14 | 2026-09-14 | ca97cad | `pytest tests/test_async_policy_pipeline_cpu.py` | [证据](./evidence/g1-cpu-closed-loop.md) | 空/未 stepped 不推进版本；真实权重同步未接 |
+| T08a | 部分：最小指标已实现 | 2026-09-14 | 2026-09-14 | ca97cad | `pytest tests/test_async_policy_pipeline_cpu.py::test_batch_metrics_capture_versions_lag_and_decision` | [证据](./evidence/g1-cpu-closed-loop.md) | run/batch ID、Vt/Vr/Vb、lag、决策、阶段时间 |
 | T08b | 计划 | | | | | | |
 | T09 | 计划 | | | | | | |
 | T10 / G2 | 计划 | | | | | | |
@@ -378,7 +378,7 @@ T02 / T03 与 T04 可交错推进。T14 即使没有测到加速，也要交付�
 | T14 | 计划 | | | | | | |
 | T15 | 计划 | | | | | | |
 | T16 / G4 | 计划 | | | | | | |
-| F1–F4 | 未开 | | | | | | 记录 PR 编号与合入日期 |
+| F1–F4 | F1/F2 已推送到 `origin/feat/async-policy-trainer`，未开 PR | 2026-09-14 | | 1f73e23, ca97cad | `pytest tests/test_async_policy_*.py` | [证据](./evidence/g1-cpu-closed-loop.md) | 待 G0 通过后按 F1 开 PR，记录 PR 编号与合入日期 |
 
 ## 9. 后续扩展
 
