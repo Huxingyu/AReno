@@ -2,25 +2,31 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
 import gc
 import itertools
 import json
 import os
-from pathlib import Path
 import random
 import threading
 import time
 import tracemalloc
 import weakref
+from dataclasses import asdict
+from pathlib import Path
 
 import pytest
 
 from areno.experimental.async_policy import (
-    AsyncPolicyConfig, AsyncPolicyPipeline, AsyncPrompt, BoundedReadyQueue,
-    FakeRolloutEngine, FakeTrainEngine, FakeWeightSync, InflightClosed,
-    InflightLimiter, QueueAborted, QueueEmpty,
+    AsyncPolicyConfig,
+    AsyncPolicyPipeline,
+    AsyncPrompt,
+    BoundedReadyQueue,
+    InflightClosed,
+    InflightLimiter,
+    QueueAborted,
+    QueueEmpty,
 )
+from tests.async_policy_validation.fakes import FakeRolloutEngine, FakeTrainEngine, FakeWeightSync, sample_reward
 
 
 def config(**kwargs):
@@ -38,7 +44,7 @@ def pipeline(*, data=None, cfg=None, rollout=None, train=None, sync=None, reward
     return AsyncPolicyPipeline(config=cfg or config(), data_source=prompts() if data is None else data,
                                rollout_engine=rollout or FakeRolloutEngine(),
                                train_engine=train or FakeTrainEngine(), weight_sync=sync or FakeWeightSync(),
-                               reward_fn=reward or (lambda prompt, sample: float(sample)))
+                               reward_fn=reward or sample_reward)
 
 
 def save(name, value):
@@ -149,12 +155,13 @@ def test_train_failure_report_records_started_run():
 def test_stage_failure_propagates_and_releases_resources(stage):
     boom = ValueError(f"injected {stage} failure")
     rollout, train, sync = FakeRolloutEngine(), FakeTrainEngine(), FakeWeightSync()
-    reward = lambda prompt, sample: float(sample)
+    reward = sample_reward
     if stage == "reward":
-        def reward(prompt, sample):
+        def reward(record):
             raise boom
     else:
-        {"rollout": rollout, "train": train, "sync": sync}[stage].failures[0] = boom
+        # Call 0 now performs mandatory initial alignment; inject the runtime sync.
+        {"rollout": rollout, "train": train, "sync": sync}[stage].failures[1 if stage == "sync" else 0] = boom
     pipe = pipeline(rollout=rollout, train=train, sync=sync, reward=reward)
     with pytest.raises(ValueError) as caught:
         pipe.run()
@@ -299,9 +306,9 @@ def test_seeded_capacity_and_lag_matrix(seed):
 
         delays = {str(i): reward_rng.uniform(0, 0.002) for i in range(16)}
 
-        def reward(prompt, sample):
-            time.sleep(delays[prompt.prompt_id])
-            return float(sample)
+        def reward(record):
+            time.sleep(delays[record.metadata["prompt_id"]])
+            return float(record.metadata["sample_index"])
 
         train = Train()
         pipe = pipeline(data=prompts(16), cfg=config(queue_capacity=q, max_inflight_rollouts=k,

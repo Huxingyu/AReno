@@ -10,10 +10,15 @@ from areno.experimental.async_policy import (
     AsyncPrompt,
     DeviceMode,
     DualEngineBridge,
+    PolicyPipelineCoordinator,
+    ShutdownTimeout,
+)
+from tests.async_policy_validation.fakes import (
     FakeRolloutEngine,
     FakeTrainEngine,
     FakeWeightSync,
-    PolicyPipelineCoordinator,
+    ready_batch,
+    sample_reward,
 )
 
 
@@ -107,22 +112,21 @@ def test_max_steps_does_not_report_success_with_live_producer() -> None:
         rollout_engine=rollout,
         train_engine=train,
         weight_sync=FakeWeightSync(),
-        reward_fn=lambda prompt, sample: float(sample),
+        reward_fn=sample_reward,
     )
     try:
-        report = pipeline.run()
-        state_at_return = {
-            "exit_reason": report.exit_reason,
-            "producer_alive": pipeline.producer_alive,
-            "inflight_active": pipeline.inflight_active,
-        }
+        # An uncooperative operation cannot be killed; missing the 20 ms
+        # shutdown budget must fail instead of advertising max_steps success.
+        with pytest.raises(ShutdownTimeout):
+            pipeline.run()
+        assert pipeline.report().exit_reason == "failed"
+        assert pipeline.producer_alive and pipeline.inflight_active > 0
     finally:
         release_rollout.set()
-        pipeline.close()
-        pipeline._producer.join(timeout=2)
+        pipeline.close(timeout_s=2)
 
-    assert not state_at_return["producer_alive"], state_at_return
-    assert state_at_return["inflight_active"] == 0
+    assert not pipeline.producer_alive
+    assert pipeline.inflight_active == 0
 
 
 def test_sync_mode_rejects_rollout_during_active_training() -> None:
@@ -141,7 +145,7 @@ def test_sync_mode_rejects_rollout_during_active_training() -> None:
 
     def train() -> None:
         try:
-            bridge.train(object(), timeout_s=2)
+            bridge.train(ready_batch(), timeout_s=2)
         except BaseException as exc:
             errors.append(exc)
 

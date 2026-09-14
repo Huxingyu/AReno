@@ -75,6 +75,12 @@ class TorchRollout:
         self.started_events = {}
         self.gates = {}
 
+    def initialize(self, *, timeout_s=None):
+        pass
+
+    def close(self, *, timeout_s=None):
+        pass
+
     def generate(self, prompt, version, *, timeout_s=None):
         call = self.calls
         self.calls += 1
@@ -110,10 +116,8 @@ class TorchRollout:
         finally:
             self.audit.record("rollout", "end", prompt_id=prompt.prompt_id, version=version)
 
-    def reward(self, prompt, sample):
-        # The experimental callback only receives (prompt, sample_index).
-        # This test-only lookup supplies the actual generated completion reward.
-        return self.records[prompt.prompt_id]["rewards"][sample]
+    def reward(self, record):
+        return token_reward([token for token, enabled in zip(record.tokens, record.loss_mask, strict=True) if enabled])
 
 
 def reference_values(model, rows):
@@ -147,6 +151,12 @@ class TorchTrain:
         self.batches = []
         self.started_events = {}
         self.gates = {}
+
+    def initialize(self, *, timeout_s=None):
+        pass
+
+    def close(self, *, timeout_s=None):
+        pass
 
     def train(self, batch, version, *, timeout_s=None):
         call = self.calls

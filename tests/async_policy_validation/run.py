@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import argparse
 import ast
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
 import importlib.metadata
 import json
 import os
-from pathlib import Path
 import platform
 import signal
 import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
 
 
 def run_group(node: str, output: Path, root: Path, timeout: float) -> dict:
@@ -61,10 +61,13 @@ def main() -> int:
     parser.add_argument("--case", help="Only functions whose name contains this substring")
     parser.add_argument("--include-semantics-probe", action="store_true",
                         help="Include the known comparison against a different loss objective")
+    parser.add_argument("--include-core", action="store_true", help="Also isolate the additional rewrite contracts")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--timeout", type=float, default=45)
     args = parser.parse_args()
+    if args.jobs < 1 or args.timeout <= 0:
+        parser.error("jobs and timeout must be positive")
     root = Path(__file__).resolve().parents[2]
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -74,8 +77,10 @@ def main() -> int:
     elif args.layer == "torch":
         files = ["torch_cases.py"]
     nodes = []
-    for filename in files:
-        path = Path(__file__).parent / filename
+    paths = [Path(__file__).parent / filename for filename in files]
+    if args.include_core:
+        paths.append(root / "tests/test_async_policy_core_cpu.py")
+    for path in paths:
         for node in ast.parse(path.read_text()).body:
             if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
                 if (node.name == "test_stale_loss_matches_behavior_policy_clipped_reference"
@@ -87,11 +92,14 @@ def main() -> int:
         parser.error("no matching cases")
     metadata = {
         "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
+        "worktree_status": subprocess.check_output(["git", "status", "--porcelain"], cwd=root, text=True),
+        "repo_root": str(root),
         "date_utc": datetime.now(timezone.utc).isoformat(),
         "python": sys.version, "platform": platform.platform(), "cuda_visible_devices": "",
         "packages": {p: importlib.metadata.version(p) for p in ("torch", "numpy", "pydantic", "pytest")},
         "nodes": nodes, "jobs": args.jobs, "timeout_s": args.timeout,
         "include_semantics_probe": args.include_semantics_probe,
+        "include_core": args.include_core,
     }
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     results = []

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
 import threading
+from dataclasses import asdict
 
 import pytest
 import torch
@@ -12,12 +12,24 @@ from areno.api.backend.cuda.losses import grpo_loss_fn
 from areno.api.backend.cuda.training import make_train_pack
 from areno.engine.runtime.train_step import _pack_train_data
 from areno.experimental.async_policy import (
-    AsyncPolicyPipeline, AsyncPrompt, BatchContractError, BridgeStateError,
-    DualEngineBridge, PipelineClosed, PolicyPipelineCoordinator, build_batch_envelope,
+    AsyncPolicyPipeline,
+    AsyncPrompt,
+    BatchContractError,
+    BridgeStateError,
+    DualEngineBridge,
+    PipelineClosed,
+    PolicyPipelineCoordinator,
+    build_batch_envelope,
 )
-
-from protocol_cases import assert_drained, config, save
-from tiny_backend import engines, fingerprint, reference_values, TinyPolicy, TorchSync, vector
+from tests.async_policy_validation.protocol_cases import assert_drained, config, save
+from tests.async_policy_validation.tiny_backend import (
+    TinyPolicy,
+    TorchSync,
+    engines,
+    fingerprint,
+    reference_values,
+    vector,
+)
 
 
 def prompts(count):
@@ -88,13 +100,14 @@ def test_bridge_initialize_aligns_real_weights():
 def test_partial_sync_failure_blocks_poisoned_rollout():
     coordinator = PolicyPipelineCoordinator()
     rollout, train, _, audit = engines(coordinator)
-    sync = TorchSync(train, rollout, audit, coordinator, fail_partial=True)
+    sync = TorchSync(train, rollout, audit, coordinator)
     bridge = DualEngineBridge(train_engine=train, rollout_engine=rollout, weight_sync=sync,
                               coordinator=coordinator, train_devices=("cpu:train",),
                               rollout_devices=("cpu:rollout",))
     bridge.initialize()
+    sync.fail_partial = True
     batch = ready_batch(rollout)
-    assert bridge.train(batch)
+    assert bridge.train(batch).stepped
     with pytest.raises(RuntimeError, match="partial tensor transfer"):
         bridge.sync()
     save("partial-transfer", dict(version=coordinator.rollout_policy_version,
