@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -350,19 +352,38 @@ def _gloo_policy_sync_worker(global_rank: int, port: int, output_queue) -> None:
         destroy_process_group()
 
 
-def test_real_gloo_collectives_reshard_train_tp2_to_rollout_tp1() -> None:
+def _run_gloo_workers(worker_fn, result_count: int):
     ctx = mp.get_context("spawn")
     output_queue = ctx.Queue()
     # Coordinator-held store mirrors production: workers join as client stores.
     store = _create_rendezvous_store("127.0.0.1", 3)
     port = int(store.port)
-    processes = [ctx.Process(target=_gloo_policy_sync_worker, args=(rank, port, output_queue)) for rank in range(3)]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=30)
-    assert [process.exitcode for process in processes] == [0, 0, 0]
-    assert output_queue.get(timeout=5) == torch.arange(8, dtype=torch.float32).reshape(4, 2).tolist()
+    processes = [ctx.Process(target=worker_fn, args=(rank, port, output_queue)) for rank in range(3)]
+    started = []
+    try:
+        for process in processes:
+            process.start()
+            started.append(process)
+        deadline = time.monotonic() + 30
+        for process in started:
+            process.join(timeout=max(0, deadline - time.monotonic()))
+        assert [process.exitcode for process in started] == [0, 0, 0]
+        return [output_queue.get(timeout=5) for _ in range(result_count)]
+    finally:
+        for process in started:
+            if process.is_alive():
+                process.kill()
+        for process in started:
+            process.join(timeout=2)
+            process.close()
+        output_queue.cancel_join_thread()
+        output_queue.close()
+
+
+def test_real_gloo_collectives_reshard_train_tp2_to_rollout_tp1(monkeypatch) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    result = _run_gloo_workers(_gloo_policy_sync_worker, 1)[0]
+    assert result == torch.arange(8, dtype=torch.float32).reshape(4, 2).tolist()
 
 
 def _gloo_policy_sync_reverse_worker(global_rank: int, port: int, output_queue) -> None:
@@ -401,20 +422,8 @@ def _gloo_policy_sync_reverse_worker(global_rank: int, port: int, output_queue) 
         destroy_process_group()
 
 
-def test_real_gloo_collectives_reshard_train_tp1_to_rollout_tp2() -> None:
-    ctx = mp.get_context("spawn")
-    output_queue = ctx.Queue()
-    # Coordinator-held store mirrors production: workers join as client stores.
-    store = _create_rendezvous_store("127.0.0.1", 3)
-    port = int(store.port)
-    processes = [
-        ctx.Process(target=_gloo_policy_sync_reverse_worker, args=(rank, port, output_queue)) for rank in range(3)
-    ]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=30)
-    assert [process.exitcode for process in processes] == [0, 0, 0]
-    shards = sorted((output_queue.get(timeout=5) for _ in range(2)), key=lambda item: item[0])
+def test_real_gloo_collectives_reshard_train_tp1_to_rollout_tp2(monkeypatch) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    shards = sorted(_run_gloo_workers(_gloo_policy_sync_reverse_worker, 2), key=lambda item: item[0])
     combined = torch.cat([torch.tensor(rows) for _, rows in shards], dim=0)
     torch.testing.assert_close(combined, torch.arange(8, dtype=torch.float32).reshape(4, 2))

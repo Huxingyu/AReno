@@ -180,6 +180,14 @@ class ArenoWorker:
             return self.save_checkpoint(cmd.payload)
         if cmd.op is Op.EXPORT_ADAPTER:
             return self.export_adapter(cmd.payload)
+        if cmd.op is Op.SAVE_TRAINING_STATE:
+            from areno.engine.checkpoints.training_state import save_training_state
+
+            return save_training_state(self, cmd.payload.path)
+        if cmd.op is Op.LOAD_TRAINING_STATE:
+            from areno.engine.checkpoints.training_state import load_training_state
+
+            return load_training_state(self, cmd.payload.path)
         if cmd.op is Op.POLICY_SYNC_PLAN:
             return self.policy_sync_plan(cmd.payload)
         if cmd.op is Op.POLICY_SYNC_PUBLISH:
