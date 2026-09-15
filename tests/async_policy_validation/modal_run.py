@@ -20,9 +20,11 @@ def main() -> int:
     import modal
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("prepare", "baseline", "async", "trace", "faults", "extended-faults", "full", "compiled", "graphs", "regression", "resume", "bench-41", "bench-42", "bench-43"), required=True)
+    parser.add_argument("--phase", choices=("prepare", "baseline", "async", "trace", "faults", "extended-faults", "full", "compiled", "graphs", "regression", "resume", "example", "bench-41", "bench-42", "bench-43"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    task_timeout = 1800 if args.phase.startswith("bench-") else 1200
+    subprocess_timeout = task_timeout - 150
     root = Path(__file__).resolve().parents[2]
 
     def git(*command: str) -> str:
@@ -39,7 +41,7 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "request.json").write_text(json.dumps({
         "sha": sha, "baseline_sha": BASELINE_SHA, "branch": branch, "phase": args.phase,
-        "gpu": "L4:2", "gpu_task_timeout_s": 1200, "subprocess_timeout_s": 1050,
+        "gpu": "L4:2", "gpu_task_timeout_s": task_timeout, "subprocess_timeout_s": subprocess_timeout,
         "model": "Qwen/Qwen3-0.6B", "model_hub": "modelscope",
     }, indent=2) + "\n")
 
@@ -128,6 +130,9 @@ def main() -> int:
         if phase == "resume":
             command = [sys.executable, "tests/async_policy_validation/resume_run.py",
                        "--model-path", model["model_path"], "--output-dir", str(output)]
+        if phase == "example":
+            command = [sys.executable, "tests/async_policy_validation/example_run.py",
+                       "--model-path", model["model_path"], "--output-dir", str(output)]
         metadata = {"command": command, "source_sha": source_sha, "phase": phase, "gpu_request": "L4:2"}
         started = time.monotonic()
         process = None
@@ -136,7 +141,7 @@ def main() -> int:
                 process = subprocess.Popen(command, cwd=workspace, stdout=log, stderr=subprocess.STDOUT,
                                            start_new_session=True, env={**os.environ, "PYTHONUNBUFFERED": "1"})
                 try:
-                    metadata["return_code"] = process.wait(timeout=1050)
+                    metadata["return_code"] = process.wait(timeout=subprocess_timeout)
                 except subprocess.TimeoutExpired:
                     metadata["timeout"] = True
                     os.killpg(process.pid, signal.SIGKILL)
@@ -167,7 +172,7 @@ def main() -> int:
         remote = app.function(name="prepare", cpu=2, memory=8192, timeout=1200, **resources)(run_remote)
     else:
         remote = app.function(name="dual_l4_test", gpu="L4:2", cpu=4, memory=16384,
-                              timeout=1200, startup_timeout=300, **resources)(run_remote)
+                              timeout=task_timeout, startup_timeout=300, **resources)(run_remote)
     with modal.enable_output(), app.run():
         result = remote.remote(args.phase, sha, branch, remote_url)
     artifact = result.pop("artifact", None)
