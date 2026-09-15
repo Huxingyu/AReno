@@ -143,10 +143,9 @@ def main() -> int:
 
         model = json.loads((storage / "model.json").read_text())
         reports_only = phase in {"full", "resume-full", "reevaluate"}
-        # Write large checkpoints directly to durable storage. Compressing tens
-        # of GB after training can consume the entire GPU task timeout.
-        output_root = storage if reports_only else workspace / "runs" / "async-policy-rewrite" / "gpu"
-        output = output_root / f"{phase}-{source_sha[:12]}-{run_id}"
+        # Retain partial evidence if Modal preempts a container. Large states
+        # also avoid an expensive archive/copy after GPU work has finished.
+        output = storage / f"{phase}-{source_sha[:12]}-{run_id}"
         output.mkdir(parents=True, exist_ok=True)
         command = [
             sys.executable, "examples/async_policy/tools/gpu_run.py", "--mode", phase,
@@ -189,12 +188,15 @@ def main() -> int:
         archive_path = storage / f"{phase}-{source_sha}-{run_id}{archive_suffix}"
         metadata = {"command": command, "source_sha": source_sha, "phase": phase,
                     "run_id": run_id, "gpu_request": gpu_request, "volume_artifact": archive_path.name,
-                    "volume_output_dir": output.name if reports_only else None,
+                    "volume_output_dir": output.name,
                     "downloaded_artifact_scope": "reports" if reports_only else "all"}
         started = time.monotonic()
         process = None
         try:
-            with (output / "console.log").open("w") as log:
+            # A preemption retry must preserve the first attempt's evidence.
+            # Return the partial artifacts and require a fresh request instead
+            # of overwriting logs or silently repeating paid training.
+            with (output / "console.log").open("x") as log:
                 process = subprocess.Popen(command, cwd=workspace, stdout=log, stderr=subprocess.STDOUT,
                                            start_new_session=True, env={**os.environ, "PYTHONUNBUFFERED": "1"})
                 try:
