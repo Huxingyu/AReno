@@ -20,7 +20,7 @@ def main() -> int:
     import modal
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("prepare", "baseline", "async", "trace", "faults", "extended-faults", "full", "compiled", "graphs", "regression", "bench-41", "bench-42", "bench-43"), required=True)
+    parser.add_argument("--phase", choices=("prepare", "baseline", "async", "trace", "faults", "extended-faults", "full", "compiled", "graphs", "regression", "resume", "bench-41", "bench-42", "bench-43"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
@@ -125,6 +125,9 @@ def main() -> int:
             command = [sys.executable, "tests/async_policy_validation/benchmark_run.py",
                        "--seed", phase.split("-")[1], "--model-path", model["model_path"],
                        "--output-dir", str(output)]
+        if phase == "resume":
+            command = [sys.executable, "tests/async_policy_validation/resume_run.py",
+                       "--model-path", model["model_path"], "--output-dir", str(output)]
         metadata = {"command": command, "source_sha": source_sha, "phase": phase, "gpu_request": "L4:2"}
         started = time.monotonic()
         process = None

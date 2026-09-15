@@ -203,3 +203,23 @@ def test_native_pipeline_stop_interrupts_pending_rpc_before_shutdown_deadline(tm
         handle._pending.event.set()
         runner.join(timeout=6)
         pipeline.close(timeout_s=1)
+
+
+def test_native_training_checkpoint_failure_does_not_publish_partial_directory(tmp_path):
+    pair = make_pair(tmp_path)
+
+    def save(path, **kwargs):
+        from pathlib import Path
+
+        (Path(path) / "adapter_model.safetensors").write_bytes(b"incomplete weights")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("optimizer writer failed")
+
+    pair.save_checkpoint = save
+    pair._call = fail
+    destination = tmp_path / "checkpoint-1"
+    with pytest.raises(RuntimeError, match="optimizer writer failed"):
+        pair.save_training_checkpoint(str(destination))
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".checkpoint-1-*"))

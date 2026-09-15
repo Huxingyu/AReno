@@ -51,8 +51,10 @@ def load_prompts(path: Path, tokenizer):
 class CheckpointedTrain:
     """Save only while the training consumer owns its model lease."""
 
-    def __init__(self, pair, output: Path, steps: int):
+    def __init__(self, pair, output: Path, steps: int, *, save_training_state: bool = False):
         self.pair, self.output, self.steps = pair, output, steps
+        self.initial_version = pair.initial_policy_version
+        self.save_training_state = save_training_state
         self.events = []
 
     def initialize(self, *, timeout_s):
@@ -71,8 +73,9 @@ class CheckpointedTrain:
         self.events.append(event)
         with (self.output / "updates.jsonl").open("a") as stream:
             stream.write(json.dumps(event) + "\n")
-        if stepped and version + 1 in {1, self.steps}:
-            self.pair.save_checkpoint(str(self.output / f"checkpoint-{version + 1}"), timeout_s=deadline.remaining())
+        if stepped and version + 1 in {self.initial_version + 1, self.initial_version + self.steps}:
+            save = self.pair.save_training_checkpoint if self.save_training_state else self.pair.save_checkpoint
+            save(str(self.output / f"checkpoint-{version + 1}"), timeout_s=deadline.remaining())
         return stepped
 
     def close(self, *, timeout_s):
@@ -80,7 +83,8 @@ class CheckpointedTrain:
 
 
 def run_training(*, model_path: str, data_path: Path, output: Path, mode: str = "async",
-                 steps: int = 55, seed: int = 41, lag: int = 1, worker_cls=None) -> dict:
+                 steps: int = 55, seed: int = 41, lag: int = 1, worker_cls=None,
+                 resume_from: str | None = None, save_training_state: bool = False) -> dict:
     import torch
 
     from areno.adapters.config import LoraConfig
@@ -89,6 +93,7 @@ def run_training(*, model_path: str, data_path: Path, output: Path, mode: str = 
     from areno.api.tokenizer import configure_chat_template_enable_thinking, load_tokenizer
     from areno.experimental.async_policy.bridge import DualEngineBridge
     from areno.experimental.async_policy.contracts import AsyncPolicyConfig, DeviceMode
+    from areno.experimental.async_policy.coordination import PolicyPipelineCoordinator
     from areno.experimental.async_policy.data import build_batch_envelope, score_prompt_group
     from areno.experimental.async_policy.native import NativeCudaEnginePair
     from areno.experimental.async_policy.pipeline import AsyncPolicyPipeline
@@ -106,8 +111,10 @@ def run_training(*, model_path: str, data_path: Path, output: Path, mode: str = 
                         runtime={"compile_model": False, "eager_decode": True, "attn_backend": "flash"})
     sampling = SamplingParams(max_prompt_len=128, max_new_tokens=64, seed=seed)
     pair = NativeCudaEnginePair(model_path=model_path, config=config, sampling_params=sampling,
-                               tokenizer=tokenizer, n_samples=4, mini_bs=1, seed=seed, worker_cls=worker_cls)
-    training = CheckpointedTrain(pair, output, steps)
+                               tokenizer=tokenizer, n_samples=4, mini_bs=1, seed=seed, worker_cls=worker_cls,
+                               resume_from=resume_from)
+    training = CheckpointedTrain(pair, output, steps, save_training_state=save_training_state or resume_from is not None)
+    coordinator = PolicyPipelineCoordinator(train_policy_version=pair.initial_policy_version)
     policy = AsyncPolicyConfig(max_steps=steps, max_policy_lag=lag, operation_timeout_s=300, shutdown_timeout_s=30)
 
     def decode(tokens):
@@ -126,11 +133,11 @@ def run_training(*, model_path: str, data_path: Path, output: Path, mode: str = 
         pipeline = AsyncPolicyPipeline(config=policy, data_source=itertools.cycle(prompts),
                                        train_engine=training, rollout_engine=pair.rollout_engine,
                                        weight_sync=pair.weight_sync, reward_fn=recorded_reward,
-                                       decode=decode, eos_token_id=tokenizer.eos_token_id)
+                                       decode=decode, eos_token_id=tokenizer.eos_token_id, coordinator=coordinator)
         stop = pipeline.request_stop
     else:
         bridge = DualEngineBridge(train_engine=training, rollout_engine=pair.rollout_engine,
-                                  weight_sync=pair.weight_sync, config=policy, mode=DeviceMode.SYNC)
+                                  weight_sync=pair.weight_sync, config=policy, mode=DeviceMode.SYNC, coordinator=coordinator)
         stop = bridge.supervisor.stop
     interrupted = []
 
@@ -142,6 +149,7 @@ def run_training(*, model_path: str, data_path: Path, output: Path, mode: str = 
     summary = {"mode": mode, "seed": seed, "policy": asdict(policy), "runtime": config.runtime,
                "model_path": model_path, "sampling": sampling.model_dump(),
                "lora_rank": 8, "lora_alpha": 16, "n_samples": 4, "mini_bs": 1, "learning_rate": 1e-5,
+               "resume_from": resume_from, "initial_policy_version": pair.initial_policy_version,
                "data_path": str(data_path), "source_sha": subprocess.check_output(
                    ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()}
     try:
@@ -186,6 +194,8 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=55)
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--lag", type=int, default=1)
+    parser.add_argument("--save-training-state", action="store_true", help="Include optimizer and train RNG state")
+    parser.add_argument("--resume-from", help="Resume a training-state checkpoint; the prompt iterator starts afresh")
     args = parser.parse_args()
     model_path = args.model
     if not Path(model_path).is_dir():
@@ -193,7 +203,8 @@ def main() -> int:
 
         model_path = snapshot_download(model_path)
     result = run_training(model_path=model_path, data_path=args.data_path, output=args.output_dir,
-                          mode=args.mode, steps=args.steps, seed=args.seed, lag=args.lag)
+                          mode=args.mode, steps=args.steps, seed=args.seed, lag=args.lag,
+                          resume_from=args.resume_from, save_training_state=args.save_training_state)
     print(json.dumps({"ok": result["ok"], "output": str(args.output_dir)}))
     return 0 if result["ok"] else 1
 

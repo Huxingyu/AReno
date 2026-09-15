@@ -7,7 +7,10 @@ translates model operations to the existing worker protocol and bounds waits.
 from __future__ import annotations
 
 import copy
+import json
 import queue
+import shutil
+import tempfile
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -75,6 +78,7 @@ class NativeCudaEnginePair:
     def __init__(
         self, *, model_path: str, config: CudaConfig, sampling_params: SamplingParams,
         tokenizer: Any, n_samples: int = 4, mini_bs: int = 1, seed: int = 41, worker_cls: type | None = None,
+        resume_from: str | None = None,
     ):
         if not Path(model_path).is_dir():
             raise ValueError("native async adapters require a resolved local checkpoint (use ModelScope first)")
@@ -90,6 +94,21 @@ class NativeCudaEnginePair:
             raise ValueError("native async acceptance requires actual checkpoint weights")
         self.model_path = model_path
         self.config = copy.deepcopy(config)
+        self.resume_from = resume_from
+        self.initial_policy_version = 0
+        if resume_from is not None:
+            from areno.adapters.config import LoraConfig
+
+            metadata = json.loads((Path(resume_from) / "training_state.json").read_text())
+            if metadata.get("format") != 1 or metadata.get("has_lora") != (config.lora is not None):
+                raise ValueError("incompatible training-state checkpoint")
+            self.initial_policy_version = metadata["global_step"]
+            if type(self.initial_policy_version) is not int or self.initial_policy_version < 0:
+                raise ValueError("checkpoint policy version must be a nonnegative integer")
+            if config.lora is not None:
+                self.config.lora = LoraConfig(adapter_path=resume_from)
+            else:
+                self.model_path = resume_from
         self.sampling_params = sampling_params.model_copy(deep=True)
         self.tokenizer = tokenizer
         self.n_samples = n_samples
@@ -149,6 +168,12 @@ class NativeCudaEnginePair:
         start_partitioned_clusters(self._clusters["train"], self._clusters["rollout"], world)
         deadline.check()
         self._initialized = True
+        if self.resume_from is not None:
+            from areno.engine.protocol import Op, SaveCheckpointPayload
+
+            restored = self._call("train", Op.LOAD_TRAINING_STATE, SaveCheckpointPayload(path=self.resume_from), deadline)[0]
+            if restored["global_step"] != self.initial_policy_version:
+                raise RuntimeError("restored optimizer and coordinator starting versions disagree")
 
     def _require_ready(self) -> None:
         if not self._initialized or self._closed:
@@ -257,6 +282,26 @@ class NativeCudaEnginePair:
             op, payload = Op.SAVE_CHECKPOINT, SaveCheckpointPayload(path=path)
         result = self._call(role, op, payload, Deadline(timeout_s))[0]
         return result["path"]
+
+    def save_training_checkpoint(self, path: str, *, timeout_s: float | None = 60) -> str:
+        """Atomically save policy and optimizer state while holding the train lease."""
+        from areno.engine.protocol import Op, SaveCheckpointPayload
+
+        destination = Path(path)
+        if destination.exists():
+            raise FileExistsError(f"checkpoint already exists: {path}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}-", dir=destination.parent))
+        deadline = Deadline(timeout_s)
+        try:
+            self.save_checkpoint(str(staging), timeout_s=deadline.remaining())
+            self._call("train", Op.SAVE_TRAINING_STATE, SaveCheckpointPayload(path=str(staging)), deadline)
+            deadline.check()
+            staging.rename(destination)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
+        return str(destination)
 
     def close(self, *, timeout_s: float | None) -> None:
         from areno.engine.protocol import Command, Op

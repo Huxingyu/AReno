@@ -47,6 +47,8 @@ class Op(Enum):
     POLICY_SYNC_PUBLISH = auto()
     POLICY_SYNC_RECEIVE = auto()
     SHUTDOWN = auto()
+    SAVE_TRAINING_STATE = auto()
+    LOAD_TRAINING_STATE = auto()
 
 
 @dataclass(slots=True)
