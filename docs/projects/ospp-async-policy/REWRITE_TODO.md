@@ -47,14 +47,16 @@
 
 **R4：真实 GPU 与完整交付**
 
-- [ ] 同资源双 GPU 同步基线，然后 Qwen3-0.6B LoRA 异步 smoke：Q=2、K=1、C=1、lag=1，prompt 上限 128、生成上限 64、n_samples=4，至少 3–5 次成功更新。
-- [ ] 用可关联的 GPU 活动证明 rollout / train 实际重叠；完成原生同步、保存 / 重载和清理。
+- [x] 同资源双 GPU 同步基线，然后 Qwen3-0.6B LoRA 异步 smoke：Q=2、K=1、C=1、lag=1，prompt 上限 128、生成上限 64、n_samples=4，至少 3–5 次成功更新。
+- [x] 用可关联的 GPU 活动证明 rollout / train 实际重叠；完成原生同步、保存 / 重载和清理。
 - [ ] 注入 worker / NCCL / 同步失败与中断，验证停止预算、资源回收、重启和最后成功 checkpoint 的保留。
 - [ ] 补小模型全参数同步、原同步 GRPO / GSPO 回归，检查默认 API 行为不变。
 - [ ] 同资源比较吞吐、等待、lag / drop 和质量；关键配置至少 3 次运行，预热后至少 50 次更新或固定测量窗口，包含无收益 / 退化结果。
 - [ ] 正式示例和必需数据随功能交付，干净 checkout 可复现，代码 / 配置 / 日志中的 SHA 一致。
 
 CPU 两份模型不替代双 GPU 证据；短 smoke 不代表收敛或质量保证。每阶段保存当前 SHA 下的新结果，不能用历史通过状态代替验收。
+
+第三项已覆盖 worker 强制退出、同步接收失败、进程回收、最后成功 LoRA checkpoint 保留和同容器重新启动；独立通信超时、外部中断及 optimizer 状态续训尚未验证，保持未勾选。首轮同步基线使用同一原生适配器和 `DeviceMode.SYNC`；独立上游 GRPO / GSPO GPU 回归仍属于第四项。
 
 **本机验收记录：2026-09-15**
 
@@ -114,4 +116,42 @@ git worktree add --detach runs/async-policy-rewrite/upstream 48d07c5
 git worktree remove runs/async-policy-rewrite/upstream
 ```
 
-正常 `pytest tests/ -k cpu` 也会收集新增 75 项；S1 不自动收集，其显式运行命令见 [测试说明](KNOWN_ISSUES.md)。R4 全部保持未验收状态。
+正常 `pytest tests/ -k cpu` 也会收集新增 75 项；S1 不自动收集，其显式运行命令见 [测试说明](KNOWN_ISSUES.md)。上述 CPU 验收完成时 R4 尚未开始，后续 GPU 结果见下节。
+
+**Modal 首轮验收记录：2026-09-15**
+
+这是以上 CPU 记录之后执行的 R4 首轮验证。原生 GPU 实现与同步 / 异步 / trace 的源码 SHA 为 `11c7e3bf54e2d4f00960e5585746b974ec19df1e`；故障 / 重启和补充样本记录使用 `54bf560f2f0b2eb23c8a5486a1cbdd54451a6e70`，后者只修改验证工具。所有云端代码均先在本地提交并推送，再由容器 fetch / checkout；每次检查请求 SHA、实际 checkout 与日志 SHA 相同。
+
+配置：同一容器内 NVIDIA L4 × 2，每卡实际可见约 22.03 GiB；训练 GPU 0、生成 GPU 1，TP=1 / DP=1。模型通过 ModelScope 下载 Qwen3-0.6B；LoRA rank=8 / alpha=16，microbatch=1、每组 4 条 completion，Q=2 / K=1 / C=1 / lag=1，prompt≤128 / response≤64。Torch 2.8.0+cu128、FlashAttention 2.8.3、Transformers 5.17.0、ModelScope 1.40.0；关闭 torch.compile，使用 eager decode。数据为随测试交付的 8 条算术 prompt，使用答案命中和小幅 token 多样性奖励，仅验证运行机制。
+
+| 检查 | 实测结果 |
+|---|---|
+| 双卡同步对照 | 5 次真实 optimizer update，梯度非零；6 次同步包含初始版本 0 |
+| 异步流水线 | 5 次真实 update；5 次同步，0 stale drop，Q 峰值 1、K 峰值 1；max_steps 正常停止 |
+| GPU 实际重叠 | 独立 trace 运行完成 5 次 update；83,181 个训练内核、377,916 个生成内核，经 CPU 时钟标记对齐，找到至少 846 μs 的跨卡内核重叠 |
+| 同步互斥 | 六个运行的 worker 事件中，sync 与 rollout / train 的重叠冲突均为 0 |
+| 权重与保存重载 | 每次成功同步逐项比较 392 个 LoRA 张量，值完全一致；四次正常运行的 checkpoint 经公共 Trainer SDK 重载、导出比较均完全一致，并再次生成 |
+| 显存 | 正常短训练的 PyTorch 峰值 allocated：训练约 2.693 GiB、生成约 2.711 GiB；不把它当作包含全部驱动 / NCCL 分配的 nvidia-smi 总显存 |
+| 接收端同步故障 | 版本 1 接收端主动报错；原异常传播，Vt=1 / Vr=0，checkpoint-1 保留，全部 worker 被回收；用例含初始化共约 17.02 秒 |
+| worker 强退 | 第二次训练强制退出，exitcode=23 被识别；checkpoint-1 保留、无存活子进程；用例含初始化共约 18.45 秒 |
+| 故障后重启 | 在同一容器重新创建流水线，再完成 5 次 update 和保存重载；没有声称恢复了 optimizer 状态 |
+| 本地 CPU 回归 | 在干净 `54bf560` 上，原 75 项 + 8 项原生适配器边界测试，共 83 项通过 |
+
+合计观察到 22 次成功 update（包含两个故障用例各 1 次）、24 次成功同步。注入的两次失败是预期行为；本轮没有暴露新的功能性失败。每次运行均无残留 producer / worker；5 个 Modal App 全部 stopped，最终查询到的活动容器为 0。
+
+运行前后工作区账单快照的计量费用增加约 **$0.35**，当前由已有额度抵扣，`billed_cost` 仍为 0。账单快照和各任务的命令、SHA、指标、样本、checkpoint、原始 trace 位于忽略的 `runs/async-policy-rewrite/modal/`，入口是 `overview.json`。完整 trace 约 1.1 GiB，未加入 Git。单次命令时间包含初始化 / 重载，trace 还引入显著开销；本轮不报告吞吐提升或训练质量结论。
+
+在已有 Modal 配置的机器上，从干净且已推送的本分支复现：
+
+```bash
+uv venv --python python3 runs/async-policy-rewrite/modal-venv
+uv pip install --python runs/async-policy-rewrite/modal-venv/bin/python 'modal[api-proxy-support]==1.5.5'
+modal_python=runs/async-policy-rewrite/modal-venv/bin/python
+"$modal_python" tests/async_policy_validation/modal_run.py --phase prepare --output-dir runs/async-policy-rewrite/modal/prepare
+"$modal_python" tests/async_policy_validation/modal_run.py --phase baseline --output-dir runs/async-policy-rewrite/modal/baseline
+"$modal_python" tests/async_policy_validation/modal_run.py --phase async --output-dir runs/async-policy-rewrite/modal/async
+"$modal_python" tests/async_policy_validation/modal_run.py --phase trace --output-dir runs/async-policy-rewrite/modal/trace
+"$modal_python" tests/async_policy_validation/modal_run.py --phase faults --output-dir runs/async-policy-rewrite/modal/faults
+```
+
+prepare 只使用 CPU，完成 CUDA 扩展构建和 ModelScope 缓存；GPU 任务固定 `L4:2`，最多一个容器、无自动重试、20 分钟硬超时，内部测试子进程为 17.5 分钟超时并终止进程组。模型和结果保存在专用 Modal Volume；原始结果也下载回本地。CUDA 构建输入有变化时，启动器会拒绝复用旧扩展，必须先更新镜像构建。
