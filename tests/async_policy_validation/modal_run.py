@@ -20,7 +20,7 @@ def main() -> int:
     import modal
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("prepare", "baseline", "async", "trace", "faults"), required=True)
+    parser.add_argument("--phase", choices=("prepare", "baseline", "async", "trace", "faults", "extended-faults", "full", "compiled", "graphs"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]

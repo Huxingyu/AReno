@@ -15,6 +15,17 @@ from areno.engine.worker import ArenoWorker
 
 class ObservedWorker(ArenoWorker):
     def __init__(self, config):
+        from areno.engine.runtime.decode_graph import DecodeGraph
+
+        self._graph_replays = 0
+        replay = DecodeGraph.replay_tensors
+
+        def observed_replay(graph, *args, **kwargs):
+            result = replay(graph, *args, **kwargs)
+            self._graph_replays += 1
+            return result
+
+        DecodeGraph.replay_tensors = observed_replay
         super().__init__(config)
         self._observation_dir = Path(os.environ["ARENO_R4_OUTPUT"])
         self._observed_counts: dict[str, int] = {}
@@ -38,10 +49,22 @@ class ObservedWorker(ArenoWorker):
                     row["clock_inside_ns"] = time.time_ns()
             if kind == "train" and count == 2 and os.environ.get("ARENO_R4_FAULT") == "worker_exit":
                 os._exit(23)
+            fault = os.environ.get("ARENO_R4_FAULT", "")
+            if kind == "rollout" and fault in {"sigint", "sigterm"} and (self._observation_dir / "checkpoint-1").is_dir():
+                (self._observation_dir / "fault-ready.json").write_text(json.dumps({
+                    "fault": fault, "pid": os.getpid(), "monotonic_s": time.monotonic(),
+                }))
+                time.sleep(120)
             result = function()
             torch.cuda.synchronize(self.device)
             row["max_allocated_bytes"] = torch.cuda.max_memory_allocated(self.device)
             row["max_reserved_bytes"] = torch.cuda.max_memory_reserved(self.device)
+            row["graph_replays"] = self._graph_replays
+            row["decode_graph_buckets"] = sorted(self._decode_graphs)
+            if self.config.runtime.compile_model:
+                from torch._dynamo.utils import counters
+
+                row["compiled_graphs"] = counters["stats"]["unique_graphs"]
             row["ok"] = True
             return result
         except BaseException as exc:
@@ -69,6 +92,11 @@ class ObservedWorker(ArenoWorker):
         return self._observe("rollout", lambda: super(ObservedWorker, self).run_rollout_command(command))
 
     def receive_policy(self, payload):
+        if payload.version == 1 and os.environ.get("ARENO_R4_FAULT") == "timeout":
+            (self._observation_dir / "fault-ready.json").write_text(json.dumps({
+                "fault": "timeout", "pid": os.getpid(), "monotonic_s": time.monotonic(),
+            }))
+            time.sleep(120)
         if payload.version == 1 and os.environ.get("ARENO_R4_FAULT") == "receive":
             raise RuntimeError("injected native policy receiver failure at version 1")
         return super().receive_policy(payload)

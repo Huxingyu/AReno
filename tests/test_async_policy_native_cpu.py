@@ -140,3 +140,66 @@ def test_native_pair_reaps_uncooperative_workers_with_shared_budget(tmp_path):
                     process.kill()
                 process.join(timeout=2)
                 process.close()
+
+
+def test_native_pipeline_stop_interrupts_pending_rpc_before_shutdown_deadline(tmp_path):
+    from areno.api.models import RolloutResult, RolloutSequence
+    from areno.engine.protocol import Op
+    from areno.experimental.async_policy.contracts import AsyncPolicyConfig, AsyncPrompt
+    from areno.experimental.async_policy.pipeline import AsyncPolicyPipeline
+
+    pair = make_pair(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+    handle = Handle(result=[None], ready=False)
+
+    class PendingCluster:
+        def submit(self, op, payload=None):
+            entered.set()
+            return handle
+
+        def call(self, op, payload, timeout):
+            entered.set()
+            if not release.wait(timeout):
+                raise TimeoutError("pending native rollout")
+            return [None]
+
+    def generate(prompt, version, *, timeout_s):
+        pair._call("rollout", Op.INFER_ROLLOUT, None, Deadline(timeout_s))
+        return RolloutResult(sequences=[RolloutSequence(resp_tokens=[2], resp_logprobs=[-1.0])])
+
+    pair._initialized = True
+    pair._clusters = {"rollout": PendingCluster()}
+    pair.generate = generate
+    pair.close = lambda **kwargs: closed.set()
+    pipeline = AsyncPolicyPipeline(
+        config=AsyncPolicyConfig(operation_timeout_s=5, shutdown_timeout_s=0.2),
+        data_source=[AsyncPrompt("one", (1,))], train_engine=pair.train_engine,
+        rollout_engine=pair.rollout_engine,
+        weight_sync=SimpleNamespace(transfer=lambda *args, **kwargs: None),
+        reward_fn=lambda record: 1.0,
+    )
+    results = []
+
+    def run():
+        try:
+            results.append(pipeline.run())
+        except BaseException as exc:
+            results.append(exc)
+
+    runner = threading.Thread(target=run)
+    runner.start()
+    try:
+        assert entered.wait(2)
+        pipeline.request_stop()
+        runner.join(timeout=0.5)
+        assert not runner.is_alive()
+        assert closed.is_set(), "native workers were never closed after stop"
+        assert len(results) == 1 and not isinstance(results[0], BaseException)
+        assert not results[0].producer_alive
+    finally:
+        release.set()
+        handle._pending.event.set()
+        runner.join(timeout=6)
+        pipeline.close(timeout_s=1)

@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import copy
 import queue
-import time
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .contracts import AsyncPrompt, BatchEnvelope, BridgeStateError, ShutdownTimeout, SyncPlan
+from .contracts import AsyncPrompt, BatchEnvelope, BridgeStateError, PipelineClosed, ShutdownTimeout, SyncPlan
 from .coordination import Deadline
 
 if TYPE_CHECKING:
@@ -20,11 +20,13 @@ if TYPE_CHECKING:
     from areno.api.models import RolloutResult, SamplingParams
 
 
-def _wait_handles(handles: list, deadline: Deadline) -> list:
+def _wait_handles(handles: list, deadline: Deadline, stop_event: threading.Event | None = None) -> list:
     """Observe either side's error promptly, including paired NCCL calls."""
     pending = dict(enumerate(handles))
     results = [None] * len(handles)
     while pending:
+        if stop_event is not None and stop_event.is_set():
+            raise PipelineClosed("native RPC cancelled by pipeline stop")
         deadline.check()
         for index, handle in tuple(pending.items()):
             # ClusterCallHandle has no public readiness probe. Waiting on its
@@ -33,16 +35,18 @@ def _wait_handles(handles: list, deadline: Deadline) -> list:
                 results[index] = handle.result(timeout=0)
                 del pending[index]
         if pending:
-            time.sleep(min(0.01, deadline.remaining() or 0.01))
+            next(iter(pending.values()))._pending.event.wait(min(0.01, deadline.remaining() or 0.01))
     return results
 
 
-def _make_cluster(config, worker_cls, world_spec, partition, deadline: Deadline):
+def _make_cluster(config, worker_cls, world_spec, partition, deadline: Deadline, stop_event):
     from areno.engine.protocol import TPCluster
 
     class BoundedStartupCluster(TPCluster):
         def _wait_for_worker_ready(self, pending: set[int]) -> None:
             while pending:
+                if stop_event is not None and stop_event.is_set():
+                    raise PipelineClosed("native startup cancelled by pipeline stop")
                 deadline.check()
                 try:
                     rank, result = self.result_queue.get(timeout=min(0.1, deadline.remaining() or 0.1))
@@ -96,12 +100,18 @@ class NativeCudaEnginePair:
         self._initialized = False
         self._closed = False
         self._context = None
+        self._stop_event: threading.Event | None = None
         self.train_stats: list[dict] = []
         self.sync_stats: list[dict] = []
         self.worker_exits: list[dict] = []
         self.train_engine = _NativeTrain(self)
         self.rollout_engine = _NativeRollout(self)
         self.weight_sync = _NativeSync(self)
+
+    def bind_stop_event(self, event: threading.Event) -> None:
+        if self._stop_event is not None and self._stop_event is not event:
+            raise BridgeStateError("native pair cannot be shared by different supervisors")
+        self._stop_event = event
 
     def initialize(self, *, timeout_s: float | None) -> None:
         if self._initialized:
@@ -134,7 +144,7 @@ class NativeCudaEnginePair:
                 reference_mode=cfg.reference_mode, policy_sync_bucket_mb=cfg.policy_sync_bucket_mb,
             )
             self._clusters[part.role] = _make_cluster(
-                engine_config, self._worker_cls or ArenoWorker, world, part, deadline,
+                engine_config, self._worker_cls or ArenoWorker, world, part, deadline, self._stop_event,
             )
         start_partitioned_clusters(self._clusters["train"], self._clusters["rollout"], world)
         deadline.check()
@@ -147,7 +157,9 @@ class NativeCudaEnginePair:
     def _call(self, role: str, op, payload, deadline: Deadline):
         self._require_ready()
         deadline.check()
-        return self._clusters[role].call(op, payload, timeout=deadline.remaining())
+        if self._stop_event is not None and self._stop_event.is_set():
+            raise PipelineClosed("native RPC cancelled by pipeline stop")
+        return _wait_handles([self._clusters[role].submit(op, payload)], deadline, self._stop_event)[0]
 
     def generate(self, prompt: AsyncPrompt, version: int, *, timeout_s: float | None) -> RolloutResult:
         from areno.api.backend.cuda.generation import rollout_options
@@ -221,14 +233,14 @@ class NativeCudaEnginePair:
         self._require_ready()
         deadline = Deadline(timeout_s)
         clusters = (self._clusters["train"], self._clusters["rollout"])
-        plans = _wait_handles([cluster.submit(Op.POLICY_SYNC_PLAN) for cluster in clusters], deadline)
+        plans = _wait_handles([cluster.submit(Op.POLICY_SYNC_PLAN) for cluster in clusters], deadline, self._stop_event)
         if not plans[0][0] or plans[0] != plans[1]:
             raise RuntimeError("native policy synchronization layouts are empty or unequal")
         payload = PolicySyncPayload(version=plan.target_version, bucket_bytes=self.config.policy_sync_bucket_mb * 1024**2)
         results = _wait_handles([
             clusters[0].submit(Op.POLICY_SYNC_PUBLISH, payload),
             clusters[1].submit(Op.POLICY_SYNC_RECEIVE, payload),
-        ], deadline)
+        ], deadline, self._stop_event)
         summaries = [result[0] for result in results]
         if any(row["version"] != plan.target_version or row["bytes"] <= 0 for row in summaries):
             raise RuntimeError("native policy transfer was not acknowledged by both workers")
@@ -307,6 +319,9 @@ class _NativeTrain:
     def initialize(self, *, timeout_s):
         self.pair.initialize(timeout_s=timeout_s)
 
+    def bind_stop_event(self, event):
+        self.pair.bind_stop_event(event)
+
     def train(self, batch, version, *, timeout_s):
         return self.pair.train(batch, version, timeout_s=timeout_s)
 
@@ -320,6 +335,9 @@ class _NativeRollout:
 
     def initialize(self, *, timeout_s):
         self.pair._require_ready()
+
+    def bind_stop_event(self, event):
+        self.pair.bind_stop_event(event)
 
     def generate(self, prompt, version, *, timeout_s):
         return self.pair.generate(prompt, version, timeout_s=timeout_s)

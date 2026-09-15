@@ -45,6 +45,10 @@ class DualEngineBridge:
         self._weight_sync = weight_sync
         self._opened: list[TrainEngine | RolloutEngine] = []
         self._close_lock = threading.Lock()
+        for engine in (train_engine, rollout_engine):
+            bind_stop_event = getattr(engine, "bind_stop_event", None)
+            if callable(bind_stop_event):
+                bind_stop_event(self.supervisor.stop_event)
 
     def initialize(self, *, timeout_s: float | None = None) -> SyncMetric | None:
         deadline = Deadline(self.config.operation_timeout_s if timeout_s is None else timeout_s)
