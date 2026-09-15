@@ -1,0 +1,39 @@
+{
+  "source_branch": "feat/async-policy-trainer",
+  "source_head": "ca97cad578d857de56355d4e772e14c63d2bec44",
+  "source_was_untracked": true,
+  "files": [
+    {
+      "path": "REWRITE_ASSESSMENT.md",
+      "sha256": "8fabafa7616ede30d705656aa2ce19a9b9a09f731f1a62df5e7ff4847273a291"
+    },
+    {
+      "path": "evidence/README.md",
+      "sha256": "73eb57a03cac00ba704872759d5a40bb392e488185b42326b390539a550cf27d"
+    },
+    {
+      "path": "evidence/g1-cpu-closed-loop.md",
+      "sha256": "2afd508cc50b5bbe8dbd4f81e0f1c3ccfc35210a53c0b1771d0667ad572f1470"
+    },
+    {
+      "path": "evidence/requirements-audit.json",
+      "sha256": "3cfea2ae6ba5804e5977c6a57c8adb30a58d07a4558e7ce4cbb8f358a5f0953a"
+    },
+    {
+      "path": "evidence/sync-baseline-gpu.json",
+      "sha256": "be4b4ee7bb6e311e61f02c360cdbf15e4036324914a03828b3d1bc7406c6728a"
+    },
+    {
+      "path": "evidence/sync-baseline-metrics.json",
+      "sha256": "1b40c40e52d9dd7c2b24171c293accb2b1b693d226c996bf58f2e3d77bc5e33f"
+    },
+    {
+      "path": "evidence/sync-baseline-reload.json",
+      "sha256": "fcaf50bb8382801738a9f24cc0618bd9bc51ad98c52338508da3e8caffa41b50"
+    },
+    {
+      "path": "evidence/sync-baseline-sample.json",
+      "sha256": "4a2b6b7745cdca9ac6c67f66ed2bf62ef403aa448f18202a402a5de9b1a9d64d"
+    }
+  ]
+}

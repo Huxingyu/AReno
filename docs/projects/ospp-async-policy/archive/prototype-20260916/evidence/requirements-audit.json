@@ -1,0 +1,41 @@
+{
+  "audit_date": "2026-09-13",
+  "upstream_main": "60e2fa73f331ea5f5f7245f0793084fbebe9d76c",
+  "prototype_commit": "5248ac2",
+  "main_tests": {
+    "result": "17 passed, 2 deselected in 23.24s",
+    "command": "python -m pytest -q tests/test_algorithms_cpu.py tests/test_dual_engine_backend_cpu.py tests/test_policy_tensor_sync_cpu.py -k 'not real_gloo_collectives' -p no:cacheprovider"
+  },
+  "prototype_tests": {
+    "result": "7 passed in 47.43s",
+    "command": "PYTHONPATH=\"$PWD\" python -m pytest -q tests/test_async_policy_coordinator_cpu.py -p no:cacheprovider"
+  },
+  "sync_pending_probe": {
+    "rollouts_admitted_while_sync_pending": 5,
+    "admitted_policy_versions": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "sync_outcomes": [
+      "sync_completed"
+    ],
+    "thread_exited": true
+  },
+  "algorithms": [
+    "dpo",
+    "grpo",
+    "gspo",
+    "ppo",
+    "sft"
+  ],
+  "pr480": {
+    "state": "open",
+    "merged": false,
+    "head": "01e6baf20b02394f5fabbde8f170cc1ac4c53b57",
+    "tests_rerun_in_this_audit": false
+  },
+  "gpu_training_rerun_in_this_audit": false
+}
