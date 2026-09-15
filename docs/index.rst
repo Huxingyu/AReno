@@ -25,6 +25,7 @@ AReno documentation
 
    Training Loop <concepts/training-loop>
    Backend Topology <concepts/backend-topology>
+   Experimental Async Policy <concepts/async-policy>
    Chat Templates <concepts/chat-templates>
    Dataset Formats <concepts/dataset-formats>
    Multimodal Inputs <concepts/multimodal-inputs>
@@ -40,6 +41,7 @@ AReno documentation
 
    cookbook/writing-loaders-and-rewards
    cookbook/math-rlvr
+   cookbook/async-grpo-two-gpu
    cookbook/tictactoe-agentic-rl
    cookbook/duelgrid-visual-agent
 

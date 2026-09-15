@@ -149,11 +149,11 @@ git worktree remove runs/async-policy-rewrite/upstream
 uv venv --python python3 runs/async-policy-rewrite/modal-venv
 uv pip install --python runs/async-policy-rewrite/modal-venv/bin/python 'modal[api-proxy-support]==1.5.5'
 modal_python=runs/async-policy-rewrite/modal-venv/bin/python
-"$modal_python" tests/async_policy_validation/modal_run.py --phase prepare --output-dir runs/async-policy-rewrite/modal/prepare
-"$modal_python" tests/async_policy_validation/modal_run.py --phase baseline --output-dir runs/async-policy-rewrite/modal/baseline
-"$modal_python" tests/async_policy_validation/modal_run.py --phase async --output-dir runs/async-policy-rewrite/modal/async
-"$modal_python" tests/async_policy_validation/modal_run.py --phase trace --output-dir runs/async-policy-rewrite/modal/trace
-"$modal_python" tests/async_policy_validation/modal_run.py --phase faults --output-dir runs/async-policy-rewrite/modal/faults
+"$modal_python" examples/async_policy/tools/modal_run.py --phase prepare --output-dir runs/async-policy-rewrite/modal/prepare
+"$modal_python" examples/async_policy/tools/modal_run.py --phase baseline --output-dir runs/async-policy-rewrite/modal/baseline
+"$modal_python" examples/async_policy/tools/modal_run.py --phase async --output-dir runs/async-policy-rewrite/modal/async
+"$modal_python" examples/async_policy/tools/modal_run.py --phase trace --output-dir runs/async-policy-rewrite/modal/trace
+"$modal_python" examples/async_policy/tools/modal_run.py --phase faults --output-dir runs/async-policy-rewrite/modal/faults
 ```
 
 prepare 只使用 CPU，完成 CUDA 扩展构建和 ModelScope 缓存；GPU 任务固定 `L4:2`，每个 App 最多一个容器、无自动重试。常规任务硬超时 20 分钟，内部测试子进程超时 17.5 分钟；补测的 `bench-*` 分别为 30 / 27.5 分钟，超时终止进程组。模型和结果保存在专用 Modal Volume；原始结果也下载回本地。CUDA 构建输入有变化时，启动器会拒绝复用旧扩展，必须先更新镜像构建。
@@ -221,7 +221,7 @@ Modal 工具环境与账号配置沿用前节；从干净且已推送的分支�
 ```bash
 modal_python=runs/async-policy-rewrite/modal-venv/bin/python
 for async_phase in prepare full compiled regression extended-faults resume example bench-41 bench-42 bench-43; do
-  "$modal_python" tests/async_policy_validation/modal_run.py \
+  "$modal_python" examples/async_policy/tools/modal_run.py \
     --phase "$async_phase" --output-dir "runs/async-policy-rewrite/recheck/$async_phase"
 done
 ```

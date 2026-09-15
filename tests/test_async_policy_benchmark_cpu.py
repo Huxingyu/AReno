@@ -2,7 +2,10 @@
 
 from types import SimpleNamespace
 
-from tests.async_policy_validation.benchmark_run import measure
+import pytest
+
+from examples.async_policy.tools.benchmark_run import case_plan, measure, parse_args, quality_metrics
+from examples.async_policy.tools.matrix import build_jobs, summarize
 
 
 def test_benchmark_excludes_warmup_tokens_and_updates(tmp_path):
@@ -25,3 +28,43 @@ def test_benchmark_excludes_warmup_tokens_and_updates(tmp_path):
     assert result["trained_response_tokens"] == 5000
     assert result["trained_response_tokens_per_s"] == 100
     assert result["monitor_samples"] == 3
+
+
+def test_quality_metrics_keep_accuracy_length_and_limit_hits_separate():
+    rows = [{"correct": True, "response_tokens": 30}, {"correct": False, "response_tokens": 64}]
+    result = quality_metrics(rows, 64)
+    assert result["accuracy"] == result["token_limit_hit_rate"] == 0.5
+    assert result["mean_response_tokens"] == 47
+    assert quality_metrics(rows, 256)["token_limit_hits"] == 0
+
+
+def test_quality_matrix_keeps_training_and_evaluation_budgets_independent():
+    args = parse_args(["--model-path", "checkpoint", "--output-dir", "output", "--seed", "43",
+                       "--max-new-tokens", "256", "--eval-max-new-tokens", "64", "256",
+                       "--cases", "sync", "lag1", "lag0", "offpolicy"])
+    cases = case_plan(args)
+    assert len(cases) == 4 and len({case["label"] for case in cases}) == 4
+    assert {case["case"]: case["loss"] for case in cases}["offpolicy"] == "grpo-offpolicy"
+    assert args.max_new_tokens == 256 and args.eval_max_new_tokens == [64, 256]
+
+
+@pytest.mark.parametrize(("suite", "job_count", "run_count"), [
+    ("quality", 10, 40), ("throughput", 12, 24), ("capacity", 57, 57), ("gspo", 6, 12),
+])
+def test_matrix_size_and_missing_evidence(tmp_path, suite, job_count, run_count):
+    args = SimpleNamespace(suite=suite, seeds=None, model_path="checkpoint", output_dir=tmp_path,
+                           steps=55, warmup=5, attn_backend="native")
+    jobs = build_jobs(args)
+    assert len(jobs) == job_count
+    assert sum(len(job["cases"]) for job in jobs) == run_count
+    assert len({job["name"] for job in jobs}) == job_count
+    if suite == "capacity":
+        assert all(job["lag"] >= job["weight_sync_interval_updates"] for job in jobs)
+    result = summarize(jobs, tmp_path)
+    assert not result["complete"] and result["completed_jobs"] == 0
+    assert len(result["missing_jobs"]) == job_count
+
+
+def test_benchmark_rejects_missing_measured_window(tmp_path):
+    with pytest.raises(ValueError, match="warmup"):
+        measure({"updates": [{"stepped": True}]}, tmp_path, SimpleNamespace(), warmup=1)

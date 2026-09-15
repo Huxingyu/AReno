@@ -8,11 +8,18 @@ import os
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--full-parameters", action="store_true")
+    parser.add_argument("--attn-backend", choices=("native", "flash"), default="native")
+    args = parser.parse_args()
+
     import torch
     from gpu_run import adapter_tensors, make_inputs
     from gpu_worker import ObservedWorker
@@ -26,19 +33,16 @@ def main() -> int:
     from areno.experimental.async_policy.data import build_batch_envelope
     from areno.experimental.async_policy.native import NativeCudaEnginePair
 
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-path", required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     tokenizer, prompts = make_inputs(args.model_path)
-    rollout = RolloutResult.model_validate(json.loads(Path(__file__).with_name("sdk_train_fixture.json").read_text())["rollouts"][0][0])
+    rollout = RolloutResult.model_validate(json.loads((ROOT / "tests/async_policy_validation/sdk_train_fixture.json").read_text())["rollouts"][0][0])
     batch = build_batch_envelope(run_id="resume", batch_id="fixed", epoch=0, policy_version=0,
                                  prompt_items=[prompts[0]], rollout_results=[rollout], rewards=[0.0, 0.25, 0.5, 1.0],
                                  eos_token_id=tokenizer.eos_token_id)
     config = CudaConfig(devices=[0], rollout_devices=[1], tp_size=1, dp_size=1, rollout_tp_size=1,
-                        max_running_prompts=4, lora=LoraConfig(rank=8, alpha=16), optimizer={"lr": 1e-5},
-                        runtime={"compile_model": False, "eager_decode": True, "attn_backend": "flash"})
+                        max_running_prompts=4, lora=None if args.full_parameters else LoraConfig(rank=8, alpha=16),
+                        optimizer={"lr": 1e-5},
+                        runtime={"compile_model": False, "eager_decode": True, "attn_backend": args.attn_backend})
     results = []
     for label, resume in (("continuous", None), ("resumed", str(args.output_dir / "continuous" / "checkpoint-1"))):
         output = args.output_dir / label
@@ -96,7 +100,7 @@ def main() -> int:
         return a == b
 
     assert equal(states[0]["optimizer"], states[1]["optimizer"]), "optimizer state diverged after continuation"
-    result = {"ok": True, "equal_tensors": len(left), "max_abs_error": 0.0,
+    result = {"ok": True, "full_parameters": args.full_parameters, "equal_tensors": len(left), "max_abs_error": 0.0,
               "optimizer_state_equal": True, "cases": results}
     (args.output_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))

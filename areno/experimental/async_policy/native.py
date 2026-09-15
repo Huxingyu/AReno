@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import copy
 import json
-import queue
 import shutil
 import tempfile
 import threading
+from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -32,44 +33,12 @@ def _wait_handles(handles: list, deadline: Deadline, stop_event: threading.Event
             raise PipelineClosed("native RPC cancelled by pipeline stop")
         deadline.check()
         for index, handle in tuple(pending.items()):
-            # ClusterCallHandle has no public readiness probe. Waiting on its
-            # existing event avoids adding threads that survive a failed peer.
-            if handle._pending.event.is_set():
+            if handle.done():
                 results[index] = handle.result(timeout=0)
                 del pending[index]
         if pending:
-            next(iter(pending.values()))._pending.event.wait(min(0.01, deadline.remaining() or 0.01))
+            next(iter(pending.values())).wait(min(0.01, deadline.remaining() or 0.01))
     return results
-
-
-def _make_cluster(config, worker_cls, world_spec, partition, deadline: Deadline, stop_event):
-    from areno.engine.protocol import TPCluster
-
-    class BoundedStartupCluster(TPCluster):
-        def _wait_for_worker_ready(self, pending: set[int]) -> None:
-            while pending:
-                if stop_event is not None and stop_event.is_set():
-                    raise PipelineClosed("native startup cancelled by pipeline stop")
-                deadline.check()
-                try:
-                    rank, result = self.result_queue.get(timeout=min(0.1, deadline.remaining() or 0.1))
-                except queue.Empty:
-                    dead = self._dead_pending_workers(pending)
-                    if dead:
-                        raise RuntimeError(f"native workers exited during startup: {dead}") from None
-                    continue
-                if not result.ok:
-                    raise RuntimeError(f"rank {rank} failed during startup:\n{result.error}")
-                pending.discard(rank)
-
-        def _abort_start(self) -> None:
-            # Keep process/queue references so the bridge's one cleanup budget
-            # can reap them and report any survivor after partial startup.
-            for process in self.processes:
-                if process.is_alive():
-                    process.terminate()
-
-    return BoundedStartupCluster(config, worker_cls, world_spec=world_spec, partition=partition)
 
 
 class NativeCudaEnginePair:
@@ -78,7 +47,7 @@ class NativeCudaEnginePair:
     def __init__(
         self, *, model_path: str, config: CudaConfig, sampling_params: SamplingParams,
         tokenizer: Any, n_samples: int = 4, mini_bs: int = 1, seed: int = 41, worker_cls: type | None = None,
-        resume_from: str | None = None,
+        resume_from: str | None = None, loss_fn: Callable | None = None,
     ):
         if not Path(model_path).is_dir():
             raise ValueError("native async adapters require a resolved local checkpoint (use ModelScope first)")
@@ -114,6 +83,13 @@ class NativeCudaEnginePair:
         self.n_samples = n_samples
         self.mini_bs = mini_bs
         self.seed = seed
+        if loss_fn is None:
+            from areno.api.algorithms import grpo_loss_fn
+
+            loss_fn = grpo_loss_fn
+        if not callable(loss_fn):
+            raise TypeError("loss_fn must be callable")
+        self.loss_fn = loss_fn
         self._worker_cls = worker_cls
         self._clusters: dict[str, Any] = {}
         self._initialized = False
@@ -137,35 +113,44 @@ class NativeCudaEnginePair:
             return
         if self._closed or self._clusters:
             raise BridgeStateError("native pair is single-use")
+        from areno import ArenoEngine, OptimizerConfig, RuntimeConfig
         from areno.api.backend.cuda.losses import dispatch_loss
         from areno.api.context import Context
         from areno.api.tokenizer import eos_token_ids
-        from areno.engine.config import EngineConfig, OptimizerConfig, RuntimeConfig
         from areno.engine.protocol import ClusterPartition, DistributedWorldSpec, start_partitioned_clusters
-        from areno.engine.worker import ArenoWorker
-        from areno.models.registry import config_from_hf
 
         deadline = Deadline(timeout_s)
         cfg = self.config
         train_part = ClusterPartition("train", 0, 1, 1, tuple(cfg.devices))
         rollout_part = ClusterPartition("rollout", 1, 1, 1, tuple(cfg.rollout_devices))
         world = DistributedWorldSpec("127.0.0.1", 0, 2, train_part, rollout_part)
-        model = config_from_hf(self.model_path)
         self._context = Context(1, self.model_path, self.tokenizer, cfg, eos_token_ids(self.model_path, self.tokenizer))
         for part in (train_part, rollout_part):
-            engine_config = EngineConfig(
-                model=copy.deepcopy(model), model_path=self.model_path,
+            engine = ArenoEngine.from_pretrained(
+                self.model_path, start=False,
                 base_model_name_or_path=cfg.base_model_name_or_path or self.model_path,
-                train_loss_fn=dispatch_loss if part.role == "train" else None,
-                optimizer=OptimizerConfig(**cfg.optimizer), runtime=RuntimeConfig(**cfg.runtime),
+                loss_fn=dispatch_loss if part.role == "train" else None,
+                optimizer_config=OptimizerConfig(**cfg.optimizer), runtime_config=RuntimeConfig(**cfg.runtime),
                 tp_size=1, dp_size=1, sequence_parallel=cfg.sequence_parallel,
-                devices=list(part.devices), role=part.role, lora=cfg.lora, lora_seed=self.seed,
+                devices=list(part.devices), role=part.role, lora_config=cfg.lora,
                 reference_mode=cfg.reference_mode, policy_sync_bucket_mb=cfg.policy_sync_bucket_mb,
+                cluster_kwargs={"world_spec": world, "partition": part},
             )
-            self._clusters[part.role] = _make_cluster(
-                engine_config, self._worker_cls or ArenoWorker, world, part, deadline, self._stop_event,
+            # Construction is lazy. Preserve the pair's explicit LoRA seed and
+            # allow validation workers to be selected before any process spawns.
+            engine.config.lora_seed = self.seed
+            if self._worker_cls is not None:
+                engine.cluster.worker_cls = self._worker_cls
+            self._clusters[part.role] = engine.cluster
+        try:
+            start_partitioned_clusters(
+                self._clusters["train"], self._clusters["rollout"], world,
+                timeout_s=deadline.remaining(), stop_event=self._stop_event,
             )
-        start_partitioned_clusters(self._clusters["train"], self._clusters["rollout"], world)
+        except InterruptedError as exc:
+            if self._stop_event is not None and self._stop_event.is_set():
+                raise PipelineClosed("native startup cancelled by pipeline stop") from exc
+            raise
         deadline.check()
         self._initialized = True
         if self.resume_from is not None:
@@ -228,7 +213,6 @@ class NativeCudaEnginePair:
         ])
 
     def train(self, batch: BatchEnvelope, version: int, *, timeout_s: float | None) -> bool:
-        from areno.api.algorithms import grpo_loss_fn
         from areno.api.backend.cuda.training import make_train_pack
         from areno.engine.data import to_cpu
         from areno.engine.protocol import Op, TrainPayload
@@ -237,7 +221,7 @@ class NativeCudaEnginePair:
         packs = []
         for start in range(0, len(batch.sequences), self.mini_bs):
             pack = make_train_pack(list(batch.sequences[start:start + self.mini_bs]))
-            pack["_loss_fn"] = grpo_loss_fn
+            pack["_loss_fn"] = self.loss_fn
             packs.append([pack])
         payload = TrainPayload(to_cpu(packs, share_memory=True), gradient_accumulation_steps=len(packs))
         stats = self._call("train", Op.TRAIN, payload, deadline)[0]
@@ -304,57 +288,31 @@ class NativeCudaEnginePair:
         return str(destination)
 
     def close(self, *, timeout_s: float | None) -> None:
-        from areno.engine.protocol import Command, Op
-
         if self._closed:
             return
         deadline = Deadline(timeout_s)
-        clusters = list(self._clusters.values())
-        processes = [process for cluster in clusters for process in cluster.processes]
-        for cluster in clusters:
-            cluster._pump_stop.set()
-            for commands in cluster.cmd_queues:
-                commands.put(Command(op=Op.SHUTDOWN))
-        remaining = deadline.remaining()
-        grace = Deadline(2.0 if remaining is None else min(2.0, remaining / 3))
-        for process in processes:
-            process.join(timeout=grace.remaining())
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-        remaining = deadline.remaining()
-        terminate_wait = Deadline(2.0 if remaining is None else min(2.0, remaining / 2))
-        for process in processes:
-            process.join(timeout=terminate_wait.remaining())
-        for process in processes:
-            if process.is_alive():
-                process.kill()
-        for process in processes:
-            process.join(timeout=deadline.remaining())
-        self.worker_exits = [{"pid": process.pid, "exitcode": process.exitcode, "alive": process.is_alive()}
-                             for process in processes]
-        if any(row["alive"] for row in self.worker_exits):
-            raise ShutdownTimeout(f"native workers still alive: {self.worker_exits}")
-        for cluster in clusters:
-            if cluster._pump_thread is not None:
-                cluster._pump_thread.join(timeout=deadline.remaining())
-                if cluster._pump_thread.is_alive():
-                    raise ShutdownTimeout("native result pump still alive")
-                cluster._pump_thread = None
-            for channel in [*cluster.cmd_queues, cluster.result_queue]:
-                channel.cancel_join_thread()
-                channel.close()
-            with cluster._pending_lock:
-                pending_calls = tuple(cluster._pending_calls.items())
-            for request_id, pending in pending_calls:
-                cluster._finish_pending_call(request_id, pending, BridgeStateError("native worker pair closed"))
-            cluster.started = False
-            cluster._rendezvous_store = None
-            for process in cluster.processes:
-                process.close()
-            cluster.processes.clear()
+        clusters = list(self._clusters.items())
+        self.worker_exits = []
+        failures = []
+        for _, cluster in clusters:
+            try:
+                cluster.request_shutdown()
+            except Exception as exc:
+                failures.append(exc)
+        for index, (role, cluster) in enumerate(clusters):
+            remaining = deadline.remaining()
+            budget = 30.0 if remaining is None else remaining / (len(clusters) - index)
+            try:
+                exits = cluster.close(timeout_s=budget)
+            except Exception as exc:
+                failures.append(exc)
+                exits = cluster.worker_exits
+            self.worker_exits.extend({"role": role, **asdict(row)} for row in exits)
+        if failures or any(row["alive"] for row in self.worker_exits):
+            raise ShutdownTimeout(f"native cluster shutdown incomplete: {self.worker_exits}") from (
+                failures[0] if failures else None
+            )
         self._closed = True
-        deadline.check()
 
 
 class _NativeTrain:

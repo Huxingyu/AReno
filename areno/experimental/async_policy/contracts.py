@@ -45,6 +45,26 @@ class Lifecycle(str, Enum):
 
 @dataclass(frozen=True)
 class AsyncPolicyConfig:
+    """Bounds for one completion pipeline (all versions count optimizer steps).
+
+    ``queue_capacity`` (Q) counts ready prompt-group batches, default 2.
+    ``max_inflight_rollouts`` (K) counts production tasks from source read
+    through generation, CPU scoring and publication, default 1; GPU sessions
+    still serialize. ``weight_sync_interval_updates`` (C), default 1, counts
+    actual optimizer updates since the last weight copy. Lag can force an
+    earlier copy: sync is due at ``min(C, max_policy_lag + 1)`` updates.
+
+    ``max_policy_lag``, default 1, is the inclusive training-admission bound
+    ``train_version - batch_version``. Older batches are discarded whole.
+    It does not select a loss or provide importance-sampling correction. Zero
+    lag still permits speculative generation and stale drops; it does not
+    promise the same sample stream or trajectory as a serial sync loop.
+
+    ``max_steps`` counts successful optimizer updates in this run (None means
+    no limit, zero means no training). Operation/shutdown timeouts and the
+    queue poll interval are seconds, defaulting to 60, 60 and 0.05.
+    """
+
     queue_capacity: int = 2
     max_inflight_rollouts: int = 1
     weight_sync_interval_updates: int = 1

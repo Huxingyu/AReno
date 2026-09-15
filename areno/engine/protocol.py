@@ -11,9 +11,11 @@ request-id demux so multiple caller threads/tasks can have in-flight commands.
 from __future__ import annotations
 
 import asyncio
+import math
 import multiprocessing as mp
 import queue
 import threading
+import time
 import traceback
 from dataclasses import dataclass, replace
 from enum import Enum, auto
@@ -71,6 +73,16 @@ class WorkerResult:
     payload: Any = None
     error: str | None = None
     request_id: int | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class WorkerExit:
+    """Last observed exit status of one partition-local worker rank."""
+
+    rank: int
+    pid: int | None
+    exitcode: int | None
+    alive: bool
 
 
 @dataclass(slots=True)
@@ -224,6 +236,16 @@ class ClusterCallHandle:
         self._request_id = request_id
         self._pending = pending
 
+    def done(self) -> bool:
+        """Return whether results or an error are ready, without consuming them."""
+
+        return self._pending.event.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Wait for readiness without cancelling the request on timeout."""
+
+        return self._pending.event.wait(timeout=timeout)
+
     def result(self, timeout: float | None = None) -> list[Any]:
         """Wait for the submitted cluster call and return rank-ordered results."""
 
@@ -317,10 +339,15 @@ class TPCluster:
         self._pending_calls: dict[int, _PendingClusterCall] = {}
         self._pump_stop = threading.Event()
         self._pump_thread: threading.Thread | None = None
+        self._closed = False
+        self._cleanup_complete = False
+        self.worker_exits: list[WorkerExit] = []
 
     def start(self) -> None:
         """Spawn workers and wait until every rank has finished initialization."""
 
+        if self._closed:
+            raise RuntimeError("cluster closed")
         if self.started:
             return
         if self.world_spec is not None:
@@ -386,19 +413,13 @@ class TPCluster:
             self.cmd_queues.append(cmd_q)
             self.processes.append(proc)
 
-    def _abort_start(self) -> None:
-        """Terminate workers and release queues after startup failure."""
+    def _abort_start(self, *, timeout_s: float = 5.0) -> list[WorkerExit]:
+        """Reap partially started workers, preserving exit evidence on failure."""
 
         for proc in self.processes:
             if proc.is_alive():
                 proc.terminate()
-        for proc in self.processes:
-            proc.join(timeout=0)
-        for q in self.cmd_queues:
-            _close_queue(q)
-        _close_queue(self.result_queue)
-        self.cmd_queues = []
-        self.processes = []
+        return self.close(timeout_s=timeout_s)
 
     def _start_result_pump(self) -> None:
         """Start the single result-demux thread for all concurrent calls."""
@@ -409,12 +430,19 @@ class TPCluster:
         self._pump_thread = threading.Thread(target=self._result_pump_loop, name="areno-tpcluster-results", daemon=True)
         self._pump_thread.start()
 
-    def _wait_for_worker_ready(self, pending: set[int]) -> None:
+    def _wait_for_worker_ready(
+        self, pending: set[int], *, deadline: float | None = None, stop_event: threading.Event | None = None,
+    ) -> None:
         """Block until every worker reports that model construction is complete."""
 
         while pending:
+            if stop_event is not None and stop_event.is_set():
+                raise InterruptedError("cluster startup cancelled")
+            remaining = _remaining_time(deadline)
+            if remaining == 0:
+                raise TimeoutError("timed out waiting for worker startup")
             try:
-                rank, result = self.result_queue.get(timeout=0.2)
+                rank, result = self.result_queue.get(timeout=0.2 if remaining is None else min(0.2, remaining))
             except queue.Empty as exc:
                 dead = self._dead_pending_workers(pending)
                 if dead:
@@ -483,10 +511,12 @@ class TPCluster:
             future=future,
             loop=loop,
         )
-        with self._pending_lock:
-            self._pending_calls[request_id] = pending
         cmd = Command(op=op, payload=payload, request_id=request_id)
         with self._send_lock:
+            if self._closed:
+                raise RuntimeError("cluster closed")
+            with self._pending_lock:
+                self._pending_calls[request_id] = pending
             for q in self.cmd_queues:
                 q.put(cmd)
         return pending
@@ -526,9 +556,11 @@ class TPCluster:
         """Mark a pending call complete and wake sync/async waiters."""
 
         with self._pending_lock:
-            self._pending_calls.pop(request_id, None)
-        pending.error = error
-        pending.event.set()
+            if self._pending_calls.get(request_id) is not pending:
+                return
+            self._pending_calls.pop(request_id)
+            pending.error = error
+            pending.event.set()
         if pending.future is not None and pending.loop is not None:
             if error is None:
                 pending.loop.call_soon_threadsafe(_set_async_result, pending.future, pending.results)
@@ -564,36 +596,91 @@ class TPCluster:
                 proc.join(timeout=0)
         return dead
 
-    def close(self) -> None:
-        """Request shutdown and terminate workers that do not exit promptly."""
+    def request_shutdown(self) -> None:
+        """Stop admission and notify workers without joining them.
 
-        if not self.started:
+        Paired partitions can both begin distributed teardown before either
+        partition waits for worker exit. Call ``close`` afterwards to reap.
+        """
+        if self._cleanup_complete:
             return
-        try:
-            pump_stop = getattr(self, "_pump_stop", None)
-            if pump_stop is not None:
-                pump_stop.set()
-            pump_thread = getattr(self, "_pump_thread", None)
-            if pump_thread is not None:
-                pump_thread.join(timeout=2)
-                self._pump_thread = None
-            # Polite shutdown: SHUTDOWN op lets workers tear down the
-            # distributed context cleanly.
+        with self._send_lock:
+            was_closed = self._closed
+            self._closed = True
+            with self._pending_lock:
+                calls = list(self._pending_calls.items())
+            for request_id, pending in calls:
+                self._finish_pending_call(request_id, pending, RuntimeError("cluster closed"))
+            self._pump_stop.set()
+            # SHUTDOWN lets cooperative workers destroy their process groups.
             for q in self.cmd_queues:
-                q.put(Command(op=Op.SHUTDOWN))
+                if not was_closed:
+                    q.put(Command(op=Op.SHUTDOWN))
+
+    def close(self, *, timeout_s: float | None = None) -> list[WorkerExit]:
+        """Close admission and wake callers, then request worker shutdown.
+
+        With no timeout, retain the legacy per-worker five-second grace and
+        terminate behavior. A finite timeout covers all ranks and the result
+        pump together, escalating through shutdown, terminate and kill. Queue
+        feeders are detached on that path: joining a pipe whose reader died
+        could otherwise hang forever. ``worker_exits`` remains available when
+        a TimeoutError is raised; close can be retried to finish reaping.
+        """
+
+        deadline = _deadline_after(timeout_s)
+        if self._cleanup_complete:
+            return list(self.worker_exits)
+        self.request_shutdown()
+        pump = self._pump_thread
+        if deadline is None:
+            if pump is not None:
+                pump.join(timeout=2)
             for proc in self.processes:
                 proc.join(timeout=5)
-        finally:
-            # If a worker is still alive after the grace period, force it.
             for proc in self.processes:
                 if proc.is_alive():
                     proc.terminate()
             for proc in self.processes:
                 proc.join(timeout=0)
-            for q in self.cmd_queues:
-                _close_queue(q)
-            _close_queue(self.result_queue)
-            self.started = False
+        else:
+            grace = time.monotonic() + _remaining_time(deadline) / 3
+            for proc in self.processes:
+                proc.join(timeout=_remaining_time(grace))
+            for proc in self.processes:
+                if proc.is_alive():
+                    proc.terminate()
+            terminate = time.monotonic() + _remaining_time(deadline) / 2
+            for proc in self.processes:
+                proc.join(timeout=_remaining_time(terminate))
+            for proc in self.processes:
+                if proc.is_alive():
+                    proc.kill()
+            for proc in self.processes:
+                proc.join(timeout=_remaining_time(deadline))
+            if pump is not None:
+                pump.join(timeout=_remaining_time(deadline))
+
+        self.started = False
+        self.worker_exits = [WorkerExit(rank, proc.pid, proc.exitcode, proc.is_alive())
+                             for rank, proc in enumerate(self.processes)]
+        if deadline is not None and (any(row.alive for row in self.worker_exits)
+                                     or (pump is not None and pump.is_alive())):
+            raise TimeoutError(f"cluster shutdown incomplete: {self.worker_exits}")
+        for channel in [*self.cmd_queues, self.result_queue]:
+            if deadline is None:
+                _close_queue(channel)
+            else:
+                channel.cancel_join_thread()
+                channel.close()
+        self._pump_thread = None
+        self._rendezvous_store = None
+        if deadline is not None:
+            for proc in self.processes:
+                proc.close()
+            self.processes.clear()
+        self._cleanup_complete = True
+        return list(self.worker_exits)
 
     def __enter__(self) -> TPCluster:
         """Start the cluster for context-manager usage."""
@@ -715,13 +802,34 @@ def _set_async_exception(future: asyncio.Future, exc: BaseException) -> None:
         future.set_exception(exc)
 
 
+def _deadline_after(timeout_s: float | None) -> float | None:
+    if timeout_s is None:
+        return None
+    if isinstance(timeout_s, bool) or not math.isfinite(timeout_s) or timeout_s < 0:
+        raise ValueError("timeout_s must be nonnegative and finite")
+    return time.monotonic() + timeout_s
+
+
+def _remaining_time(deadline: float | None) -> float | None:
+    return None if deadline is None else max(0.0, deadline - time.monotonic())
+
+
 def start_partitioned_clusters(
     train_cluster: TPCluster,
     rollout_cluster: TPCluster,
     world_spec: DistributedWorldSpec,
+    *,
+    timeout_s: float | None = None,
+    stop_event: threading.Event | None = None,
 ) -> None:
-    """Spawn both partitions before waiting for their shared rendezvous."""
+    """Spawn both partitions and share one readiness deadline across ranks.
 
+    Cancellation or failure aborts both partitions. Failure cleanup has a
+    separate five-second budget shared across the partitions, so expiration
+    of the readiness deadline does not leave unobserved child processes.
+    """
+
+    deadline = _deadline_after(timeout_s)
     clusters = (train_cluster, rollout_cluster)
     if train_cluster.world_spec != world_spec or rollout_cluster.world_spec != world_spec:
         raise ValueError("both clusters must use the supplied world_spec")
@@ -737,10 +845,18 @@ def start_partitioned_clusters(
             cluster._spawn_workers()
         for cluster in clusters:
             assert cluster.partition is not None
-            cluster._wait_for_worker_ready(set(range(cluster.partition.local_world_size)))
-    except BaseException:
-        for cluster in clusters:
-            cluster._abort_start()
+            cluster._wait_for_worker_ready(set(range(cluster.partition.local_world_size)),
+                                           deadline=deadline, stop_event=stop_event)
+    except BaseException as error:
+        cleanup_deadline = _deadline_after(5.0)
+        cleanup_error = None
+        for index, cluster in enumerate(clusters):
+            try:
+                cluster._abort_start(timeout_s=_remaining_time(cleanup_deadline) / (len(clusters) - index))
+            except BaseException as exc:
+                cleanup_error = exc
+        if cleanup_error is not None:
+            raise error from cleanup_error
         raise
     for cluster in clusters:
         cluster.started = True

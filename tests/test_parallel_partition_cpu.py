@@ -206,10 +206,10 @@ def test_start_partitioned_clusters_resolves_frozen_world_spec() -> None:
         def _spawn_workers(self) -> None:
             pass
 
-        def _wait_for_worker_ready(self, ranks) -> None:
+        def _wait_for_worker_ready(self, ranks, *, deadline=None, stop_event=None) -> None:
             pass
 
-        def _abort_start(self) -> None:
+        def _abort_start(self, *, timeout_s=5.0) -> None:
             pass
 
         def _start_result_pump(self) -> None:

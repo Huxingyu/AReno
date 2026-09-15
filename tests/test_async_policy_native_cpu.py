@@ -38,6 +38,12 @@ class Handle:
             raise self.error
         return self.value
 
+    def done(self):
+        return self._pending.event.is_set()
+
+    def wait(self, timeout=None):
+        return self._pending.event.wait(timeout)
+
 
 def test_native_pair_observes_failed_receiver_while_publisher_pending():
     first = RuntimeError("receiver failed")
@@ -71,6 +77,69 @@ def test_native_pair_microbatches_produce_one_real_step(tmp_path):
     assert pair.train(batch, 7, timeout_s=1) is True
     assert len(received[0].data_packs_by_dp) == received[0].gradient_accumulation_steps == 2
     assert sum(row["stepped"] for row in pair.train_stats) == 1
+
+
+def test_native_pair_dispatches_selected_loss(tmp_path):
+    from areno.api.algorithms import gspo_loss_fn
+
+    pair = make_pair(tmp_path, loss_fn=gspo_loss_fn)
+    row = TrainSequence(tokens=[1, 2], prompt_len=1, scalar_advantage=1, logprobs=[0, -1])
+    batch = BatchEnvelope("run", "batch", 0, 0, ("prompt",), (0, 1), (row,))
+
+    def call(role, op, payload, deadline):
+        assert payload.data_packs_by_dp[0][0]["_loss_fn"] is gspo_loss_fn
+        return [[{"stepped": True, "global_step": 1}]]
+
+    pair._call = call
+    assert pair.train(batch, 0, timeout_s=1)
+
+
+def test_native_pair_uses_lazy_public_engine_construction(monkeypatch, tmp_path):
+    import areno
+    from areno.api import tokenizer
+    from areno.engine import protocol
+
+    pair = make_pair(tmp_path, seed=17, worker_cls=Handle)
+    constructed, started = [], []
+
+    def from_pretrained(path, **kwargs):
+        engine = SimpleNamespace(config=SimpleNamespace(lora_seed=None), cluster=SimpleNamespace(worker_cls=None))
+        constructed.append((path, kwargs, engine))
+        return engine
+
+    monkeypatch.setattr(areno, "ArenoEngine", SimpleNamespace(from_pretrained=from_pretrained))
+    monkeypatch.setattr(tokenizer, "eos_token_ids", lambda *args: [2])
+    monkeypatch.setattr(protocol, "start_partitioned_clusters", lambda *args, **kwargs: started.append((args, kwargs)))
+    pair.initialize(timeout_s=1)
+    assert len(constructed) == 2 and len(started) == 1
+    for path, kwargs, engine in constructed:
+        assert path == str(tmp_path) and kwargs["start"] is False
+        assert engine.config.lora_seed == 17 and engine.cluster.worker_cls is Handle
+    assert {item[1]["role"] for item in constructed} == {"train", "rollout"}
+    assert 0 < started[0][1]["timeout_s"] <= 1
+
+
+def test_native_pair_notifies_both_partitions_before_waiting_for_exit(tmp_path):
+    from areno.engine.protocol import WorkerExit
+
+    pair = make_pair(tmp_path)
+    notified = set()
+
+    class Cluster:
+        def __init__(self, role):
+            self.role = role
+
+        def request_shutdown(self):
+            notified.add(self.role)
+
+        def close(self, *, timeout_s):
+            assert notified == {"train", "rollout"}
+            assert 0 < timeout_s <= 1
+            return [WorkerExit(0, 123, 0, False)]
+
+    pair._clusters = {role: Cluster(role) for role in ("train", "rollout")}
+    pair.close(timeout_s=1)
+    assert len(pair.worker_exits) == 2
 
 
 @pytest.mark.parametrize("stats", [

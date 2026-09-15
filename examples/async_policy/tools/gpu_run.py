@@ -19,7 +19,7 @@ import traceback
 from dataclasses import asdict
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -111,7 +111,7 @@ def make_inputs(model_path):
 
     tokenizer = load_tokenizer(model_path)
     configure_chat_template_enable_thinking(tokenizer, False)
-    rows = [json.loads(line) for line in (Path(__file__).parent / "smoke_prompts.jsonl").read_text().splitlines()]
+    rows = [json.loads(line) for line in (Path(__file__).parents[1] / "smoke_prompts.jsonl").read_text().splitlines()]
     prompts = []
     for index, row in enumerate(rows):
         tokens = encode_generation_prompt(tokenizer, row["prompt"])
@@ -209,7 +209,6 @@ def run_case(model_path: str, output: Path, *, mode: str, fault: str | None = No
              resume_from: str | None = None) -> dict:
     import torch
     from gpu_worker import ObservedWorker
-    from smoke_reward import reward_fn
 
     from areno.adapters.config import LoraConfig
     from areno.api.config import CudaConfig
@@ -220,6 +219,7 @@ def run_case(model_path: str, output: Path, *, mode: str, fault: str | None = No
     from areno.experimental.async_policy.data import build_batch_envelope, score_prompt_group
     from areno.experimental.async_policy.native import NativeCudaEnginePair
     from areno.experimental.async_policy.pipeline import AsyncPolicyPipeline
+    from examples.async_policy.smoke_reward import reward_fn
 
     output.mkdir(parents=True, exist_ok=True)
     os.environ["ARENO_R4_OUTPUT"] = str(output)
@@ -380,13 +380,13 @@ def run_case(model_path: str, output: Path, *, mode: str, fault: str | None = No
 
 
 def main() -> int:
-    import torch
-
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("baseline", "async", "trace", "faults", "extended-faults", "full", "compiled", "graphs"), required=True)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    import torch
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     environment = {"python": sys.version, "torch": torch.__version__, "cuda": torch.version.cuda,
                    "cuda_available": torch.cuda.is_available(), "gpu_count": torch.cuda.device_count(),
@@ -402,7 +402,7 @@ def main() -> int:
     dump(args.output_dir / "environment.json", environment)
     assert environment["gpu_count"] == 2 and all("L4" in item["name"] for item in environment["devices"])
     subprocess.run([sys.executable, ".agents/skills/areno-run-training/scripts/inspect_dataset.py", "--dataset-path",
-                    "tests/async_policy_validation/smoke_prompts.jsonl", "--model-hub", "modelscope", "--algo", "grpo"],
+                    "examples/async_policy/smoke_prompts.jsonl", "--model-hub", "modelscope", "--algo", "grpo"],
                    cwd=ROOT, check=True)
     if args.mode in {"faults", "extended-faults"}:
         results = [run_case(args.model_path, args.output_dir / fault, mode="async", fault=fault)
