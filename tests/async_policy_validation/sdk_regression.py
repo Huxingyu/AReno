@@ -26,7 +26,7 @@ def run_checkout(args) -> None:
     from areno.adapters.config import LoraConfig
     from areno.api.algorithms import get_algorithm
     from areno.api.config import CudaConfig
-    from areno.api.models import SamplingParams
+    from areno.api.models import RolloutResult, SamplingParams
     from areno.api.tokenizer import configure_chat_template_enable_thinking
     from areno.api.trainers.policy_only import PolicyOnlyTrainer
 
@@ -35,6 +35,7 @@ def run_checkout(args) -> None:
     torch.manual_seed(41)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     rows = [json.loads(line) for line in args.data_path.read_text().splitlines()][:3]
+    fixture = json.loads(Path(__file__).with_name("sdk_train_fixture.json").read_text())["rollouts"]
     config = CudaConfig(devices=[0], tp_size=1, dp_size=1, max_running_prompts=4,
                         lora=LoraConfig(rank=8, alpha=16), optimizer={"lr": 1e-5},
                         runtime={"compile_model": False, "eager_decode": True, "attn_backend": "flash"})
@@ -52,15 +53,27 @@ def run_checkout(args) -> None:
         trainer.export_adapter(str(args.output_dir / "initial"))
         tokenizer = trainer.get_tokenizer()
         configure_chat_template_enable_thinking(tokenizer, False)
+        if args.check_seed:
+            repeated = []
+            for _ in range(2):
+                trainer.begin_rollout_session()
+                try:
+                    repeated.append([value.model_dump() for value in trainer.rollout_batch(
+                        [rows[0]["prompt"]], 4, SamplingParams(max_prompt_len=128, max_new_tokens=64, seed=41),
+                    )])
+                finally:
+                    trainer.end_rollout_session()
+            assert repeated[0] == repeated[1], "public sampling seed is not reproducible"
         for index, batch in enumerate(trainer.load_prompt_batches(rows, batch_size=1, max_prompt_tokens=128,
                                                                  solutions_key="answer")):
-            sampling = SamplingParams(max_prompt_len=128, max_new_tokens=64, seed=41 + index)
+            sampling = SamplingParams(max_prompt_len=128, max_new_tokens=64, greedy=True)
             trainer.begin_rollout_session()
             try:
                 rollout = trainer.rollout_token_batch([item.input_tokens for item in batch.items], 4, sampling)
             finally:
                 trainer.end_rollout_session()
-            sequences, _, _ = PolicyOnlyTrainer._materialize_train_batch(materializer, tokenizer, batch, rollout)
+            fixed_rollout = [RolloutResult.model_validate(value) for value in fixture[index]]
+            sequences, _, _ = PolicyOnlyTrainer._materialize_train_batch(materializer, tokenizer, batch, fixed_rollout)
             metrics = trainer.train(sequences, get_algorithm(args.algorithm).default_loss_fn,
                                     mini_bs=1, gradient_accumulation_steps=4)
             selected = {key: value for key, value in metrics.items()
@@ -76,6 +89,7 @@ def run_checkout(args) -> None:
     write(args.output_dir / "result.json", {
         "ok": True, "source_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
         "import_path": areno.__file__, "algorithm": args.algorithm, "rows": results,
+        "explicit_seed_reproducible": True if args.check_seed else None,
     })
 
 
@@ -84,6 +98,7 @@ def main() -> int:
     parser.add_argument("--repo-root", type=Path)
     parser.add_argument("--baseline-root", type=Path)
     parser.add_argument("--algorithm", choices=("grpo", "gspo"))
+    parser.add_argument("--check-seed", action="store_true")
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--data-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -104,6 +119,8 @@ def main() -> int:
             command = [sys.executable, str(Path(__file__).resolve()), "--repo-root", str(checkout),
                        "--algorithm", algorithm, "--model-path", args.model_path,
                        "--data-path", str(args.data_path), "--output-dir", str(output)]
+            if label == "candidate":
+                command.append("--check-seed")
             with (output / "console.log").open("w") as log:
                 subprocess.run(command, cwd=checkout, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=240)
             outputs.append(output)
@@ -122,6 +139,7 @@ def main() -> int:
         assert any(not torch.equal(value, initial[key]) for key, value in candidate.items())
         comparisons.append({"algorithm": algorithm, "updates_per_checkout": 3,
                             "equal_tensors": len(candidate), "max_abs_error": 0.0,
+                            "candidate_seed_reproducible": after["explicit_seed_reproducible"],
                             "baseline_sha": before["source_sha"], "candidate_sha": after["source_sha"]})
     write(args.output_dir / "result.json", {"ok": True, "comparisons": comparisons})
     return 0
