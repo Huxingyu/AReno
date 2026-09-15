@@ -74,19 +74,26 @@ def test_benchmark_rejects_missing_measured_window(tmp_path):
 
 
 @pytest.mark.parametrize("reports_only", [False, True])
-def test_artifact_reports_retain_full_checkpoints_in_volume(tmp_path, reports_only):
+def test_artifact_reports_leave_large_checkpoints_uncompressed(tmp_path, reports_only, monkeypatch):
     output = tmp_path / "output"
     (output / "checkpoint").mkdir(parents=True)
     entries = {"checkpoint/model.safetensors": b"weights", "checkpoint/training_state.pt": b"optimizer",
                "checkpoint/training_state.json": b'{"global_step":3}', "result.json": b'{"ok":true}'}
     for name, content in entries.items():
         (output / name).write_bytes(content)
+    original_add = tarfile.TarFile.add
+
+    def checked_add(archive, name, *args, **kwargs):
+        if reports_only:
+            assert str(name).endswith(".json"), "large checkpoints must never enter the compressor"
+        return original_add(archive, name, *args, **kwargs)
+
+    monkeypatch.setattr(tarfile.TarFile, "add", checked_add)
     destination = tmp_path / "volume.tar.gz"
     downloaded = collect_artifacts(output, destination, reports_only=reports_only)
+    expected = {name for name in entries if name.endswith(".json")} if reports_only else set(entries)
     with tarfile.open(destination) as archive:
-        assert set(archive.getnames()) == set(entries)
-        assert archive.extractfile("checkpoint/model.safetensors").read() == b"weights"
-        assert archive.extractfile("checkpoint/training_state.pt").read() == b"optimizer"
+        assert set(archive.getnames()) == expected
+    assert all((output / name).read_bytes() == content for name, content in entries.items())
     with tarfile.open(fileobj=io.BytesIO(downloaded)) as archive:
-        expected = {name for name in entries if name.endswith(".json")} if reports_only else set(entries)
         assert set(archive.getnames()) == expected
