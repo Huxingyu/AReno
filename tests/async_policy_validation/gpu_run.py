@@ -206,6 +206,14 @@ def run_case(model_path: str, output: Path, *, mode: str, fault: str | None = No
     def decode(tokens):
         return tokenizer.decode(tokens, skip_special_tokens=True)
 
+    def observed_reward(record):
+        value = reward_fn(record)
+        sample = {"prompt": record.prompt, "completion": record.completion, "answer": record.answer,
+                  "reward": value, "metadata": record.metadata}
+        with (output / "samples.jsonl").open("a") as stream:
+            stream.write(json.dumps(sample, ensure_ascii=False) + "\n")
+        return value
+
     metadata = {"mode": mode, "fault": fault, "source_sha": subprocess.check_output(
         ["git", "rev-parse", "HEAD"], text=True, cwd=ROOT).strip(), "config": asdict(policy_config),
         "runtime": config.runtime, "model_path": model_path, "sampling": sampling.model_dump()}
@@ -224,7 +232,7 @@ def run_case(model_path: str, output: Path, *, mode: str, fault: str | None = No
                 bridge.initialize()
                 for index, prompt in enumerate(prompts[:5]):
                     session = bridge.rollout_session(prompt)
-                    rewards = score_prompt_group(prompt, session.result, reward_fn, decode=decode, check_running=lambda: None)
+                    rewards = score_prompt_group(prompt, session.result, observed_reward, decode=decode, check_running=lambda: None)
                     batch = build_batch_envelope(run_id="sync", batch_id=str(index), epoch=0,
                                                  policy_version=session.policy_version, prompt_items=[prompt],
                                                  rollout_results=[session.result], rewards=rewards,
@@ -238,7 +246,7 @@ def run_case(model_path: str, output: Path, *, mode: str, fault: str | None = No
         else:
             pipeline = AsyncPolicyPipeline(config=policy_config, data_source=prompts,
                                            rollout_engine=pair.rollout_engine, train_engine=train,
-                                           weight_sync=checked_sync, reward_fn=reward_fn, decode=decode,
+                                           weight_sync=checked_sync, reward_fn=observed_reward, decode=decode,
                                            eos_token_id=tokenizer.eos_token_id)
             report = pipeline.run()
             summary["pipeline"] = asdict(report)
@@ -268,9 +276,15 @@ def run_case(model_path: str, output: Path, *, mode: str, fault: str | None = No
         summary["live_children"] = [{"pid": process.pid, "name": process.name} for process in multiprocessing.active_children()]
         summary["ok"] = error is None and not summary["live_children"]
         if fault:
-            expected = "receiver failure" if fault == "receive" else "worker"
-            summary["expected_fault_observed"] = error is not None and expected in str(error).lower()
+            if fault == "receive":
+                observed = error is not None and "injected native policy receiver failure" in str(error)
+            else:
+                observed = error is not None and any(row["exitcode"] == 23 for row in pair.worker_exits)
+            summary["expected_fault_observed"] = observed
             summary["ok"] = summary["expected_fault_observed"] and not summary["live_children"]
+            preserved = output / "checkpoint-1"
+            summary["successful_checkpoint_preserved"] = bool(adapter_tensors(preserved)) if preserved.is_dir() else False
+            summary["ok"] = summary["ok"] and summary["successful_checkpoint_preserved"]
             if fault == "receive":
                 summary["ok"] = summary["ok"] and summary["pipeline"]["rollout_policy_version"] == 0
         dump(output / "result.json", summary)
@@ -294,6 +308,9 @@ def main() -> int:
                                "total_memory": torch.cuda.get_device_properties(index).total_memory,
                                "capability": torch.cuda.get_device_capability(index)}
                               for index in range(torch.cuda.device_count())]
+    environment["nvidia_smi"] = subprocess.check_output([
+        "nvidia-smi", "--query-gpu=name,uuid,driver_version,memory.total", "--format=csv,noheader",
+    ], text=True).strip()
     dump(args.output_dir / "environment.json", environment)
     assert environment["gpu_count"] == 2 and all("L4" in item["name"] for item in environment["devices"])
     subprocess.run([sys.executable, ".agents/skills/areno-run-training/scripts/inspect_dataset.py", "--dataset-path",

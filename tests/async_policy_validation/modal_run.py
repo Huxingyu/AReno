@@ -130,7 +130,7 @@ def main() -> int:
             metadata["wall_s"] = time.monotonic() - started
             (output / "modal-task.json").write_text(json.dumps(metadata, indent=2) + "\n")
         packed = io.BytesIO()
-        with tarfile.open(fileobj=packed, mode="w:gz") as archive:
+        with tarfile.open(fileobj=packed, mode="w:gz", compresslevel=1) as archive:
             for path in sorted(output.rglob("*")):
                 if path.is_file():
                     archive.add(path, arcname=str(path.relative_to(output)))
