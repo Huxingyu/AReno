@@ -17,6 +17,25 @@ from pathlib import Path
 BASELINE_SHA = "48d07c54051c41bf36218f99bce1c3697e9ba63c"
 
 
+def collect_artifacts(output: Path, destination: Path, *, reports_only: bool) -> bytes:
+    """Keep the complete archive on disk; optionally return only small reports."""
+    import io
+    import tarfile
+
+    paths = sorted(path for path in output.rglob("*") if path.is_file())
+    with tarfile.open(destination, mode="w:gz", compresslevel=1) as archive:
+        for path in paths:
+            archive.add(path, arcname=str(path.relative_to(output)))
+    if not reports_only:
+        return destination.read_bytes()
+    packed = io.BytesIO()
+    with tarfile.open(fileobj=packed, mode="w:gz", compresslevel=1) as archive:
+        for path in paths:
+            if path.suffix not in {".safetensors", ".pt", ".bin"}:
+                archive.add(path, arcname=str(path.relative_to(output)))
+    return packed.getvalue()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--phase", choices=("prepare", "baseline", "async", "trace", "faults", "extended-faults", "full", "compiled", "graphs", "regression", "resume", "resume-full", "example", "bench-41", "bench-42", "bench-43", "benchmark"), required=True)
@@ -89,13 +108,11 @@ def main() -> int:
 
     def run_remote(phase: str, source_sha: str, source_branch: str, source_url: str,
                    benchmark_args: list[str], run_id: str) -> dict:
-        import io
         import json
         import os
         import signal
         import subprocess
         import sys
-        import tarfile
         import time
         import traceback
         from pathlib import Path
@@ -162,8 +179,11 @@ def main() -> int:
         if phase == "example":
             command = [sys.executable, "examples/async_policy/tools/example_run.py",
                        "--model-path", model["model_path"], "--output-dir", str(output)]
+        archive_path = storage / f"{phase}-{source_sha}-{run_id}.tar.gz"
+        reports_only = phase in {"full", "resume-full"}
         metadata = {"command": command, "source_sha": source_sha, "phase": phase,
-                    "run_id": run_id, "gpu_request": "L4:2"}
+                    "run_id": run_id, "gpu_request": "L4:2", "volume_artifact": archive_path.name,
+                    "downloaded_artifact_scope": "reports" if reports_only else "all"}
         started = time.monotonic()
         process = None
         try:
@@ -185,14 +205,12 @@ def main() -> int:
         finally:
             metadata["wall_s"] = time.monotonic() - started
             (output / "modal-task.json").write_text(json.dumps(metadata, indent=2) + "\n")
-        packed = io.BytesIO()
-        with tarfile.open(fileobj=packed, mode="w:gz", compresslevel=1) as archive:
-            for path in sorted(output.rglob("*")):
-                if path.is_file():
-                    archive.add(path, arcname=str(path.relative_to(output)))
-        # Save a second copy before returning, including failed run evidence.
-        artifact = packed.getvalue()
-        (storage / f"{phase}-{source_sha}-{run_id}.tar.gz").write_bytes(artifact)
+        sys.path.insert(0, str(workspace))
+        from examples.async_policy.tools.modal_run import collect_artifacts
+
+        # Full optimizer checkpoints can exceed host RAM when buffered together.
+        # Keep all evidence in the volume and return reports for full-model runs.
+        artifact = collect_artifacts(output, archive_path, reports_only=reports_only)
         volume.commit()
         return {**metadata, "artifact": artifact}
 
