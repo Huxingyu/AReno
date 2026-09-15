@@ -38,27 +38,31 @@ def collect_artifacts(output: Path, destination: Path, *, reports_only: bool) ->
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("prepare", "baseline", "async", "trace", "faults", "extended-faults", "full", "compiled", "graphs", "regression", "resume", "resume-full", "example", "bench-41", "bench-42", "bench-43", "benchmark"), required=True)
+    parser.add_argument("--phase", choices=("prepare", "baseline", "async", "trace", "faults", "extended-faults", "full", "compiled", "graphs", "regression", "resume", "resume-full", "example", "bench-41", "bench-42", "bench-43", "benchmark", "reevaluate"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true", help="Preview resources without contacting Modal")
     parser.add_argument("--task-timeout-s", type=int, help="Bound one remote task, including artifact collection")
     parser.add_argument("--benchmark-args", nargs=argparse.REMAINDER, default=[],
-                        help="Forward benchmark_run.py options for phase benchmark; place last")
+                        help="Forward benchmark/reevaluation options; place last")
     args = parser.parse_args()
-    if args.benchmark_args and args.phase != "benchmark":
-        parser.error("--benchmark-args requires --phase benchmark")
+    if args.benchmark_args and args.phase not in {"benchmark", "reevaluate"}:
+        parser.error("--benchmark-args requires --phase benchmark or reevaluate")
     if args.phase == "benchmark" and ("--seed" not in args.benchmark_args
                                       or any(flag in args.benchmark_args for flag in ("--model-path", "--output-dir"))):
         parser.error("benchmark arguments require --seed and must not override model/output paths")
+    if args.phase == "reevaluate" and ("--archive" not in args.benchmark_args
+                                       or any(flag in args.benchmark_args for flag in ("--model-path", "--output-dir", "--archive-root"))):
+        parser.error("reevaluation requires --archive and must not override model/output/archive-root paths")
     task_timeout = args.task_timeout_s if args.task_timeout_s is not None else (
         1800 if args.phase.startswith("bench") else 1200
     )
     if not 300 <= task_timeout <= 7200:
         parser.error("--task-timeout-s must be between 300 and 7200")
     subprocess_timeout = task_timeout - 150
+    gpu_request = "L4" if args.phase == "reevaluate" else "L4:2"
     root = Path(__file__).resolve().parents[3]
     if args.dry_run:
-        print(json.dumps({"phase": args.phase, "gpu": None if args.phase == "prepare" else "L4:2",
+        print(json.dumps({"phase": args.phase, "gpu": None if args.phase == "prepare" else gpu_request,
                           "task_timeout_s": task_timeout, "subprocess_timeout_s": subprocess_timeout,
                           "benchmark_args": args.benchmark_args, "remote_started": False}, indent=2))
         return 0
@@ -81,7 +85,8 @@ def main() -> int:
     run_id = uuid.uuid4().hex[:12]
     (args.output_dir / "request.json").write_text(json.dumps({
         "sha": sha, "baseline_sha": BASELINE_SHA, "branch": branch, "phase": args.phase,
-        "gpu": "L4:2", "gpu_task_timeout_s": task_timeout, "subprocess_timeout_s": subprocess_timeout,
+        "gpu": None if args.phase == "prepare" else gpu_request,
+        "gpu_task_timeout_s": task_timeout, "subprocess_timeout_s": subprocess_timeout,
         "model": "Qwen/Qwen3-0.6B", "model_hub": "modelscope",
         "benchmark_args": args.benchmark_args,
         "run_id": run_id,
@@ -171,6 +176,10 @@ def main() -> int:
         if phase == "benchmark":
             command = [sys.executable, "examples/async_policy/tools/benchmark_run.py",
                        "--model-path", model["model_path"], "--output-dir", str(output), *benchmark_args]
+        if phase == "reevaluate":
+            command = [sys.executable, "examples/async_policy/tools/reevaluate_run.py",
+                       "--model-path", model["model_path"], "--output-dir", str(output),
+                       "--archive-root", str(storage), *benchmark_args]
         if phase in {"resume", "resume-full"}:
             command = [sys.executable, "examples/async_policy/tools/resume_run.py",
                        "--model-path", model["model_path"], "--output-dir", str(output)]
@@ -180,9 +189,9 @@ def main() -> int:
             command = [sys.executable, "examples/async_policy/tools/example_run.py",
                        "--model-path", model["model_path"], "--output-dir", str(output)]
         archive_path = storage / f"{phase}-{source_sha}-{run_id}.tar.gz"
-        reports_only = phase in {"full", "resume-full"}
+        reports_only = phase in {"full", "resume-full", "reevaluate"}
         metadata = {"command": command, "source_sha": source_sha, "phase": phase,
-                    "run_id": run_id, "gpu_request": "L4:2", "volume_artifact": archive_path.name,
+                    "run_id": run_id, "gpu_request": gpu_request, "volume_artifact": archive_path.name,
                     "downloaded_artifact_scope": "reports" if reports_only else "all"}
         started = time.monotonic()
         process = None
@@ -219,7 +228,8 @@ def main() -> int:
     if args.phase == "prepare":
         remote = app.function(name="prepare", cpu=2, memory=8192, timeout=task_timeout, **resources)(run_remote)
     else:
-        remote = app.function(name="dual_l4_test", gpu="L4:2", cpu=4, memory=16384,
+        remote = app.function(name="reevaluate" if args.phase == "reevaluate" else "dual_l4_test",
+                              gpu=gpu_request, cpu=4, memory=16384,
                               timeout=task_timeout, startup_timeout=300, **resources)(run_remote)
     with modal.enable_output(), app.run():
         result = remote.remote(args.phase, sha, branch, remote_url, args.benchmark_args, run_id)
