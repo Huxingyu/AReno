@@ -8,9 +8,9 @@ Agentic environments motivate the design but are not supported by the native
 adapter yet. Throughput and training quality must be evaluated separately.
 
 The entry point is ``areno.experimental.async_policy.AsyncPolicyPipeline``.
-The core accepts engine adapters through explicit protocols. The companion
-native integration change supplies text completion with one training GPU and
-one rollout GPU, each with TP=1 and DP=1, and a runnable cookbook.
+The native adapter currently supports text completion with one training GPU
+and one rollout GPU, each with TP=1 and DP=1. See
+:doc:`../cookbook/async-grpo-two-gpu` for the runnable example.
 
 Two stages and one weight owner
 -------------------------------
