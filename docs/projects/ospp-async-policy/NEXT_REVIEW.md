@@ -94,10 +94,13 @@
 基线在独立 detached worktree 中运行，未切换用户工作分支。
 
 - 完整 CPU 基线：889 passed、12 failed、10 skipped。
-- 第一轮完整候选：920 passed、12 failed、10 skipped；失败 node ID 集合完全一致。
+- 第一轮完整候选：920 passed、12 failed、10 skipped；随后补充一个 S1 oracle 用例。
+- 最终 PR 4 集成候选：921 passed、12 failed、10 skipped；失败 node ID 集合与基线完全一致。原 911 个 CPU node ID 全部保留，新增 32 个；变更涉及的测试模块 149 项全部通过。
+- 四个本地 PR 分支均已提交；PR 1/2/3 独立检查分别为 5/33/90 passed。PR 4 与工程实现 `f217bac` 的代码内容一致，未推送、未创建对外 PR。
 - 文档：基线与候选 Sphinx HTML 构建无警告；两页可从 index 到达。
 - 示例及迁移工具：14 个帮助/预览命令成功，预览没有启动远端 GPU。
-- Ruff 与 `git diff --check` 已运行；最终复查、各 PR 分支证据见 [PR_SERIES.md](PR_SERIES.md)。
+- 17 种 Modal phase 资源预览均成功；不代表 GPU 阶段已经运行。
+- 本轮 20 个 Python 文件 Ruff 通过，四个分支 `git diff --check` 通过；最终复查、各 PR 分支证据见 [PR_SERIES.md](PR_SERIES.md) 和[执行证据](evidence/next-stage-validation.md)。
 
 候选代码尚无本轮双 GPU 验证。原 R4 的 GPU 成绩仅证明旧提交，不能直接继承为
 本次 protocol、native、attention 默认值或可选 loss 的验收结果。
@@ -105,3 +108,5 @@
 资料分支 2026-09-14 的记录说明 2026 采用滚动申请；不能仅因九月就断言申请期结束。
 
 具体执行记录保存在 `runs/async-policy-rewrite/next-stage/`；该目录不进入功能 PR。
+下一步的六项验收、种子 43 pilot、完整矩阵与停止条件已写成
+[GPU 执行计划](GPU_VALIDATION_PLAN.md)，待资源与预算批准后按阶段执行。

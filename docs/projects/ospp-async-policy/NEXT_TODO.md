@@ -1,10 +1,10 @@
 # 异步策略训练器：下一阶段 TODO（v3）
 
 日期：2026-09-15。基线：`feat/async-policy-rewrite` @ `a35a580`，上游起点 `48d07c5`。
-本表接续 [REWRITE_TODO.md](./REWRITE_TODO.md)（R0–R4 已勾选）和原 [TODO.md](./TODO.md)（v2，OSPP 流程与 T00–T16）。
+本表接续 [REWRITE_TODO.md](./REWRITE_TODO.md)（R0–R4 已勾选）和资料分支 `docs/ospp-async-policy` 中的 `TODO.md`（v2，OSPP 流程与 T00–T16）。
 状态纪律不变：区分"计划 / 代码存在 / 已验证"，只有证据到位才勾选。
 
-> 2026-09-16 已完成逐项源码审查并开始执行。详见 [审查报告](NEXT_REVIEW.md)、[扩展设计](EXTENSION_DESIGN.md)、[决策记录](evidence/decisions.md) 和 [PR 分支说明](PR_SERIES.md)。下文保留 a35a580 的现状描述；新代码的 CPU 证据与待补 GPU 验收分别记录，不继承旧提交的 GPU 通过状态。
+> 2026-09-16 已完成逐项源码审查、本地实现、四个 PR 分支及其验证。详见 [审查报告](NEXT_REVIEW.md)、[扩展设计](EXTENSION_DESIGN.md)、[执行证据](evidence/next-stage-validation.md) 和 [PR 分支说明](PR_SERIES.md)。下文第 0 节保留 a35a580 的历史状态；新代码的 CPU 证据与[待执行 GPU 验收](GPU_VALIDATION_PLAN.md)分别记录，不继承旧提交的 GPU 通过状态。
 
 ## 0. 完成度判定
 
@@ -45,7 +45,7 @@
 
 ## 2. P0：上游可合入性（U）
 
-本节每项都读过对应上游源码后写成；行号以 `a35a580` 为准。标注"未核实"的地方是我没读到的代码，动手前先看。
+本节方案经 2026-09-16 源码核对后更新；历史位置仍以 `a35a580` 为准。实现和验收分开标注。
 
 ### U1 去除 `native.py` 对 engine 私有成员的耦合
 
@@ -61,7 +61,7 @@
 | `close` | `_pump_stop`、`_pump_thread`、`_pending_lock`、`_pending_calls`、`_finish_pending_call`、`_rendezvous_store` | `protocol.py:567` `close()` | 上游 `close()` 固定 5 s grace + terminate，无 kill、无超时参数、不返回退出信息、不唤醒等待中的调用 |
 | `initialize` | 手工拼 `EngineConfig` 18 行 | `api.py:208` `ArenoEngine.from_pretrained` | 没有绕过的必要，是重复实现 |
 
-**方案：给上游 `protocol.py` 加最小公开接口，全部是带默认值的新参数，默认行为不变。**
+**方案：给上游 `protocol.py` 加公开接口，用带默认值的新参数保留现有调用形式；关闭与失败语义的修正明确列出。**
 
 1. `ClusterCallHandle.done() -> bool` 与 `ClusterCallHandle.wait(timeout: float | None) -> bool`：只等待 `_pending.event`，不 pop、不抛。`result()` 保持不变。约 8 行。
 2. `TPCluster.close(*, timeout_s: float | None = None) -> list[WorkerExit]`：`timeout_s=None` 保留旧 grace / terminate 路径；关闭唤醒和关闭后拒绝提交是明确修正，不声称所有失败行为完全一致。给定时按三段分配预算（SHUTDOWN grace、terminate、kill），返回每个进程的 `(rank, pid, exitcode, alive)`；关闭前用 `_finish_pending_call` 以 `RuntimeError("cluster closed")` 唤醒所有 pending call；仍有 `alive` 时抛 `TimeoutError`。`WorkerExit` 是新 dataclass。实现还需处理提交/关闭竞态、结果重复完成及 pipe feeder，不能按约 30 行估算。另增 `request_shutdown()`，让两分区先发退出通知再等待。
@@ -69,8 +69,8 @@
 4. `native.initialize` 改用 `ArenoEngine.from_pretrained(..., start=False, cluster_kwargs={"world_spec":..., "partition":...})` 构造两个引擎，与 `backend.py:225-259` 同一写法；再调 `start_partitioned_clusters(train.cluster, rollout.cluster, world, timeout_s=..., stop_event=...)`。RPC 仍用 `cluster.submit` 而不是 `ArenoEngine.generate_rollout` / `step`，因为那两个是无超时的 `cluster.call`。
 5. `native.close` 先对两个分区调用 `request_shutdown()`，再按剩余预算分配 `cluster.close(timeout_s=...)`；即使一侧失败也尝试另一侧，收集公开退出信息到 `worker_exits`。
 
-- 完成条件：`grep -n "\._pending\|_pump\|_rendezvous\|_wait_for_worker_ready\|_abort_start" areno/experimental/async_policy/native.py` 为空；`tests/test_async_policy_native_cpu.py` 8 项通过；Modal `faults` 与 `extended-faults` 阶段重跑通过。
-- 上游测试：在 `tests/test_protocol_cpu.py`（未核实是否用 CPU worker，若不是则参考 `test_dual_engine_backend_cpu.py` 的 fake worker）加 `close(timeout_s)` 返回退出信息、`done()` 不取消、`start_partitioned_clusters` 超时中止三个用例。
+- 完成条件：`grep -n "\._pending\|_pump\|_rendezvous\|_wait_for_worker_ready\|_abort_start" areno/experimental/async_policy/native.py` 为空；`tests/test_async_policy_native_cpu.py` 当前 13 项通过；Modal `faults` 与 `extended-faults` 阶段重跑通过。前两项已验证，GPU 两阶段待跑。
+- 上游测试：`test_protocol_cpu.py`、`test_parallel_partition_cpu.py` 已覆盖退出信息、非取消等待、启动超时/停止、关闭竞态与失败重试；独立 PR 2 加 checkpoint/backend/import 检查共 33 项通过。
 - 顺带：`training_state.py` 读写 `worker._global_step`，同在 engine 层可接受，但建议给 `ArenoWorker` 加 `global_step` 只读属性。
 - 评审点：接口草案先发导师；这是 PR 4 的前置，也可独立成小 PR。
 
@@ -88,7 +88,7 @@
 
 **三条路线，建议 PR 3 / 4 走 A，B / C 写进设计 issue 征求意见。**
 
-- **A（现状加说明）**：不动 `CudaBackend`。PR 描述里放上表，说明 bridge + coordinator 是 backend 三处状态在并发下的等价物，SYNC 模式与 backend 行为一致（干净上游 GRPO / GSPO 回归已证明 backend 本身未变）。代价：SDK `Trainer` 无法直接驱动异步，见 U3 的依赖。
+- **A（现状加说明）**：不动 `CudaBackend`。PR 描述里放上表，说明 bridge + coordinator 承担并发路径的准入、版本与同步职责，SYNC 模式保持模型操作互斥；不据此声称调度轨迹完全相同。旧提交的干净上游 GRPO / GSPO 回归不能代替本轮候选重跑。代价：SDK `Trainer` 无法直接驱动异步，见 U3 的依赖。
 - **B（backend 加实验开关）**：`CudaConfig` 新增 `concurrent_rollout: bool = False`（属于 AGENTS "Ask first"）。开启时 `train()` 跳过 503 行守卫；`_sync_policy_if_needed` 改为 no-op，新增公开 `sync_policy(version, timeout_s)` 供 bridge 调用；两个版本号由调用方提供。这让 `Trainer` SDK 能接异步，但改了公开 backend 行为。
 - **C（长期）**：把 coordinator 下沉到 backend，同步模式也走 `mode=SYNC` 的 coordinator，503 行守卫由它实现。这是 U3 注册 `async-grpo` 的干净前提，工作量最大。
 
@@ -102,11 +102,11 @@
 
 **要注册 `async-grpo` 需要补的东西。**
 
-1. `AsyncGRPOTrainer(config, *, instance, dataset, reward_fn, loss_fn)` 类，接口对齐 `PolicyOnlyTrainer`（未核实：`Trainer` 对 trainer_cls 要求哪些方法，读 `areno/api/trainer.py` 与 `trainers/policy_only.py` 后再定）。
+1. `AsyncGRPOTrainer(config, *, instance, dataset, reward_fn, loss_fn)` 类，接口对齐 `PolicyOnlyTrainer`，提供算法 loop 的 `fit()`。它由 CLI factory 创建；公开 SDK `Trainer` 是传入 loop 的执行实例，两者职责不同。
 2. reward 已兼容：当前 `areno/api/rewards.py` 与 `PolicyOnlyTrainer` 都使用 `reward_fn(RewardRecord) -> float`，无需为旧接口描述新增适配层。
 3. 数据适配：dataset 记录 → `AsyncPrompt`，tokenize 用 `instance` 的 tokenizer；`examples/async_policy/train.py:load_prompts` 已有雏形。
-4. Q / K / C / lag 配置通道：`TrainerConfig` 有没有扩展字段未核实。没有的话需要新增 `async_policy: AsyncPolicyConfig | None = None`，属于 "Ask first"。
-5. **依赖 U7**：若 `Trainer.init` 总是初始化 backend（未核实），A 路线下 `async-grpo` 会双重启动 worker。所以 U3 的注册要么等 U7 选 B / C，要么 trainer 自己不经过 `instance` 的 backend，只借 tokenizer。
+4. Q / K / C / lag 配置通道：当前 `TrainerConfig` 没有 `async_policy` 字段。若选择新增 `async_policy: AsyncPolicyConfig | None = None`，属于 "Ask first"；先决定入口与配置所有权，本轮不修改公开 dataclass。
+5. **依赖 U7**：`Trainer.init()` 确实初始化 backend，init 前 `get_tokenizer()` 为 None。直接叠加 A 路线会双重启动 worker；必须先确定 SDK 生命周期，或独立加载 tokenizer，不能只注册一个名义入口。
 
 - 完成条件：与导师确认三种形式选哪种；若选注册，上述 5 点各有测试；`areno train --algo async-grpo` 能跑 `examples/async_policy` 的数据。
 - 评审点：官方原文是"例如"，包形式已满足 R1；注册是加分项不是必需项，不要为它改公开 config 而不问。
@@ -130,10 +130,10 @@
 | 文件 | 去向 |
 |---|---|
 | `known_cases.py`、`protocol_cases.py`、`torch_cases.py`、`tiny_backend.py`、`fakes.py`、`reference.py`、`run.py`、`sdk_regression.py`、`sdk_train_fixture.json` | 留在 `tests/async_policy_validation/`，是 pytest 收集或显式运行的测试 |
-| `modal_run.py`、`gpu_run.py`、`gpu_worker.py`、`benchmark_run.py`、`example_run.py`、`resume_run.py` | 移到 `tools/async_policy/`（仓库是否已有 `tools/` 未核实；没有则用 `examples/async_policy/tools/`） |
+| `modal_run.py`、`gpu_run.py`、`gpu_worker.py`、`benchmark_run.py`、`example_run.py`、`resume_run.py` | 已移到 `examples/async_policy/tools/`；仓库没有现成的顶层 tools 目录 |
 | `smoke_prompts.jsonl`、`smoke_reward.py` | 并入 `examples/async_policy/` |
 
-- 完成条件：`pytest tests/ -k cpu` 不丢失任何原有测试 node ID（新增测试允许总数增加）；`modal_run.py` 的 `--phase` 全部仍可运行；REWRITE_TODO 的复现命令同步更新。
+- 完成条件：`pytest tests/ -k cpu` 不丢失任何原有测试 node ID（已验证 911 项全部保留、新增 32 项）；`modal_run.py` 的 `--phase` 全部仍可运行（17 种资源预览已过，GPU 实跑待验收）；REWRITE_TODO 的复现命令已更新。
 
 ### U6 示例脚本修正
 
@@ -155,7 +155,7 @@
 1. **`fix(cuda)`: `sampling_params.seed` 透传**。`generation.py` 1 行 + 已有 CPU 测试。无依赖，可最先合，也可中选前作为社区贡献。
 2. **`feat(engine)`: cluster 公开接口**（U1 第 1–3 步）+ `SAVE_TRAINING_STATE` / `LOAD_TRAINING_STATE` + `training_state.py`。无依赖。
 3. **`feat(experimental)`: `async_policy` 核心**：`contracts` / `coordination` / `lifecycle` / `bridge` / `data` / `pipeline` + `test_async_policy_contracts_cpu.py` + `test_async_policy_core_cpu.py` + U4 的 concepts 页。描述含 U7 的对照表。无依赖。
-4. **`feat(experimental)`: native 适配 + 示例**：`native.py`（U1 第 4–5 步之后）+ `examples/async_policy/` + U5 归位后的工具 + U4 的 cookbook 页 + `test_async_policy_native_cpu.py` / `example` / `benchmark`。依赖 2 和 3。
+4. **`feat(experimental)`: native 适配 + 示例**：`native.py`（U1 第 4–5 步之后）+ `examples/async_policy/` + U5 归位后的工具 + U4 的 cookbook 页 + `test_async_policy_native_cpu.py` / `example` / `benchmark`。实际分支合并 1/2/3，包含同步对照所需的 seed 修复。
 
 - 完成条件：四个分支各自 `git diff upstream/main --stat` 不含 `docs/projects/`、`runs/`、`REWRITE_START.md`；每个 PR 描述写明依赖与验证命令。
 
@@ -194,17 +194,20 @@
 
 ## 7. 建议顺序
 
-1. O1 先发，等待期间做 Q1（纯实验，不改代码）。
-2. U1 + U6，两者都是导师第一眼会看的。
-3. Q2 消融，结果再决定是否进入 PR 范围。
-4. U2 拆分、U4 文档，随中选结果决定开 PR 节奏。
-5. P1 / P3 作为中选后的主体工作。
+1. 本地先完成源码审查、U1/U4/U5/U6、Q2 可选实现与 U2 分支，准备 O1/O2/O4 草稿。本轮已完成这些准备。
+2. 用户确认 GPU 资源和首轮预算后，按 [GPU 计划](GPU_VALIDATION_PLAN.md) 跑新提交的六项验收；失败先修，不展开矩阵。
+3. 种子 43 pilot 通过后执行 Q1/Q2 完整对照，再按实测资源需求推进 P3/P4/E1；E2 已纳入首轮续训验收。
+4. OSPP 状态和导师收件人确认、获得发送授权后，再对外沟通；主体 PR 节奏依据真实项目状态决定。
+5. P1 根据实测瓶颈选择方案；P2/E3/E4 本阶段保持设计交付。
 
 ## 8. 2026-09-16 执行记录
 
+- 本地实现提交 `f217bac`；四个 review 分支为 `b84e509` / `ac0cd7c` / `44fe9ac` / `2b0575a`，附四份英文 PR 草稿，未推送或发布。
+- 最终完整 CPU：921 passed、12 failed、10 skipped；12 个失败与基线完全一致。原 911 个 node ID 全部保留，新增 32；变更涉及的测试模块 149 项全部通过。证据见 [next-stage-validation](evidence/next-stage-validation.md)。
+- 英文文档基线/候选/PR 3/PR 4 构建无警告；本轮 Python 改动 Ruff 和四分支 diff check 通过。
 - Q2/E1：可选 offpolicy loss、GSPO 注入与原 S1 数值 oracle 已验证；Q1/Q2/P3/P4/E1 的 GPU 矩阵未运行。
 - P2/E3/E4：仅完成 [扩展设计](EXTENSION_DESIGN.md)，没有实现生成双缓冲、Agentic 或多 rank 支持。
 - O1/O2/O3/O4：见 [OSPP_HANDOFF](drafts/OSPP_HANDOFF.md)；草稿不代表发送、申请提交或正式结项。
 - H1：资料分支 `docs/ospp-async-policy` 的 `612bffc` 归档 8 个原文件并核对 hash；原 dirty worktree 保留。
-- H2：760 个原始结果文件、7,616,137,087 bytes 已复制到实验盘镜像外并逐项验证 SHA-256。路径与清单见 `runs/async-policy-rewrite/next-stage/backup-summary.json`；本轮仍在生成的 next-stage 与可重建工具环境单列。
+- H2：760 个原始结果文件、7,616,137,087 bytes 已复制到实验盘镜像外并逐项验证 SHA-256。另补备份本轮 next-stage 的 753 个文件、50,596,664 bytes，同样逐项校验。路径与清单见 `runs/async-policy-rewrite/next-stage/backup-summary.json` 和 `next-stage-backup-summary.json`；可重建工具环境不在结果备份内。
 - H3：活动 App 列表没有本项目任务，缓存卷保留用于待跑实验。2026-09-16 查询 Modal 官方定价：Volumes $0.09/GiB/月，含 1 TiB/月免费额；账号总存储用量与最终账单未核定，不声称永久免费。
