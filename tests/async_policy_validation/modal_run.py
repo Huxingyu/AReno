@@ -20,7 +20,7 @@ def main() -> int:
     import modal
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("prepare", "baseline", "async", "trace", "faults", "extended-faults", "full", "compiled", "graphs"), required=True)
+    parser.add_argument("--phase", choices=("prepare", "baseline", "async", "trace", "faults", "extended-faults", "full", "compiled", "graphs", "regression"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
@@ -107,6 +107,20 @@ def main() -> int:
             sys.executable, "tests/async_policy_validation/gpu_run.py", "--mode", phase,
             "--model-path", model["model_path"], "--output-dir", str(output),
         ]
+        if phase == "regression":
+            baseline = workspace.parent / "areno-upstream"
+            subprocess.run(["git", "worktree", "add", "--detach", str(baseline), BASELINE_SHA],
+                           cwd=workspace, check=True)
+            # Only the already-built, identical extension is reused. Python
+            # source imports and git status are checked in each subprocess.
+            extensions = list((workspace / "areno" / "accel").glob("_areno_accel*.so"))
+            if len(extensions) != 1:
+                raise RuntimeError("expected one upstream-built CUDA extension")
+            (baseline / "areno" / "accel" / extensions[0].name).symlink_to(extensions[0])
+            command = [sys.executable, "tests/async_policy_validation/sdk_regression.py",
+                       "--baseline-root", str(baseline), "--model-path", model["model_path"],
+                       "--data-path", str(workspace / "tests/async_policy_validation/smoke_prompts.jsonl"),
+                       "--output-dir", str(output)]
         metadata = {"command": command, "source_sha": source_sha, "phase": phase, "gpu_request": "L4:2"}
         started = time.monotonic()
         process = None
