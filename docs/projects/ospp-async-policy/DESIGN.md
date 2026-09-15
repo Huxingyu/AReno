@@ -1,13 +1,13 @@
-# R0–R3：异步策略流水线设计
+# R0–R4：异步策略流水线设计
 
-本阶段交付实验性 completion 调度核心及可替换的引擎适配协议，保持上游 GRPO 的数据和 loss 语义。入口是 `areno.experimental.async_policy.AsyncPolicyPipeline`。R4 首轮已增加原生 GPU / NCCL 适配；不新增算法名称、CLI 或公开 Trainer 配置。
+本阶段交付实验性 completion 调度核心及可替换的引擎适配协议，保持上游 GRPO 的数据和 loss 语义。入口是 `areno.experimental.async_policy.AsyncPolicyPipeline`。R4 已增加原生 GPU / NCCL 适配、训练状态 checkpoint 和独立示例脚本；不新增算法名称、主 CLI 入口或公开 Trainer 配置。
 
 | 唯一所有者 | 管理内容 |
 |---|---|
 | Supervisor（pipeline 与 bridge 共享） | 生命周期、停止信号、首个异常；失败唤醒所有等待者 |
 | Coordinator | Vt / Vr、生成 / 训练 lease、同步请求合并；同一条件锁保护准入与版本提交 |
 | Producer | 唯一源迭代器、至多 K 个生产任务；取得许可后才读源，任务入队或终止才归还 |
-| 训练主线程 | 消费、batch 决策和指标；后续 checkpoint 也归此线程所有 |
+| 训练主线程 | 消费、batch 决策、指标与 checkpoint |
 
 ```mermaid
 flowchart LR
@@ -42,6 +42,12 @@ pair 的 train 端点拥有两组 worker 和共同的 TCPStore；rollout 端点�
 
 收尾先请求两个分区退出，再在同一个预算内 terminate / kill 未合作的进程并 join，最后关闭结果泵、队列和进程句柄。无法确认资源退出就报告超时。pair 不另外维护 Vt / Vr 或同步准入，所有使用均通过 bridge；部分传输失败后由共享 supervisor 禁止继续运行。
 
-GPU 验证工具中的 checkpoint 保存由训练消费者在 lease 内发起；同步核验在独占同步区内导出两端 LoRA 张量。专用测试 worker 记录真实操作、显存和 GPU profiler 事件，故障注入只存在于 tests。`max_steps` 仍按既定契约立即停止，因此最后 Vt=5 / Vr=4 合法；最终保存并重载的是训练版本 5。完整 checkpoint / optimizer 续训、编译 / CUDA graph 和长期性能验收不由首轮短测试覆盖。
+bridge 将同一个 supervisor stop event 绑定到支持 `bind_stop_event` 的端点。原生启动、RPC 和配对同步等待检查它；取消先让等待线程以 `PipelineClosed` 退出、释放 lease，再由统一收尾关闭 worker。这修复了原先先 join producer、却无法打断其长 RPC 等待的清理缺口。普通 CPU 协议适配器无需实现这个可选绑定。
+
+GPU 验证工具中的 checkpoint 保存由训练消费者在 lease 内发起；同步核验在独占同步区内导出两端张量。专用测试 worker 记录真实操作、显存、编译 / graph 重放次数和 profiler 事件，故障注入只存在于 tests。`max_steps` 仍按既定契约立即停止，因此最后 Vt=5 / Vr=4 合法；最终保存的是训练版本 5。重复性能实验使用 eager 模式；编译 / graph 正确性独立验收。
+
+`save_training_checkpoint` 在同目录的临时路径内保存权重、optimizer state、CPU / CUDA 训练 RNG 与更新计数，最后写入包含参数布局、optimizer 配置和文件校验和的 manifest，再原子重命名发布。失败不会覆盖已有成功 checkpoint。恢复前核对布局、配置与校验和，通过后才载入优化器。新增 worker 操作位于原有枚举末尾，既有命令编号和默认 SDK 路径保持不变。
+
+`NativeCudaEnginePair(resume_from=...)` 提供 `initial_policy_version`，调用者用它初始化唯一的 coordinator；初始化强制同步恢复后的权重，再开始新 batch。正式示例恢复权重、optimizer、训练 RNG 和版本，但数据源从头开始，在途 batch 不持久化。GPU 续训验收使用固定输入比较连续训练与重建进程后的续训，最终 392 个 LoRA 张量和 optimizer state 完全一致。
 
 验收入口见 [重写 TODO](REWRITE_TODO.md) 与 [已知问题](KNOWN_ISSUES.md)。原始运行输出只写到忽略的 `runs/async-policy-rewrite/`。
