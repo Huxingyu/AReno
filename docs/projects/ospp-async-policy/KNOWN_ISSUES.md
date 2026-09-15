@@ -13,11 +13,15 @@
 
 N7 属于尚未完成的初始化接入；N9 的具体验收依赖快照 / 所有权转移契约。不能把这些描述成所有正常运行都会触发的故障，也不能只改说明文字来掩盖缺口。
 
+上表描述原型历史。新实现已逐项运行原 30 项契约并通过，结果见 [本次验收](REWRITE_TODO.md)。K3 改为验证无法在预算内结束的后端会明确报关闭超时，并在释放 gate 后完成清理；初始同步现在真实执行，因此运行期 / 部分同步故障在初始对齐成功后注入。
+
+重写补测实际暴露并修复了两处边界错误：producer 线程启动失败时，join 未启动线程导致已初始化引擎未被关闭；失败退出时，消费者的空轮询等待未计入总时间。对应回归为 `test_producer_start_failure_still_closes_initialized_engines` 和 `test_failed_run_wait_metric_includes_empty_polls`。追加测试也固定了初始化参数校验、单次关闭预算、首因与次生错误、真实零梯度 step、内存复用隔离和所有等待者的关闭唤醒。
+
 **S1：保留既定 loss**
 
 现有 GRPO 的 `exp(logp - logp.detach())` 数值为 1，但梯度仍存在。它与使用行为策略 logprob 作分母的目标不同。原方案已明确保留现有 loss，限制 lag 并做质量观察。S1 不计新增 bug，也不要求在调度重写中改成另一套目标；有限 lag 不保证质量不退化。
 
-**只保留六个必要测试文件**
+**测试入口**
 
 | 文件，均在 `tests/async_policy_validation/` | 用途 |
 |---|---|
@@ -27,16 +31,17 @@ N7 属于尚未完成的初始化接入；N9 的具体验收依赖快照 / 所�
 | `torch_cases.py` | CPU 闭环、初始对齐、部分同步失败、payload 和 S1 |
 | `reference.py` | 指定 checkout 的同步 / 异步 materialization 和一步数值对照 |
 | `run.py` | 子进程隔离和超时；默认运行契约测试，S1 需显式加入 |
+| `fakes.py` | 仅用于测试的确定性适配器与 gate / 故障注入 |
 
-这些测试依赖待实现的异步模块，干净上游阶段出现模块缺失表示尚未实现。它们来自原型审计，不是新分支已通过的结果。旧测试访问 `_cond`、`_queue`、`_producer` 等私有对象；可以改为新接口或故障注入点，保留行为要求，不需要重建旧结构。
+实现位于 `areno/experimental/async_policy/`；测试替身没有放入生产包。`tests/test_async_policy_contracts_cpu.py` 将原 30 项纳入正常 CPU 收集，`tests/test_async_policy_core_cpu.py` 增加 45 项契约。部分测试访问 `_cond`、`_queue` 等内部对象以精确观察等待或注入故障，生产调用仍统一经过 bridge。
 
-旧 reward callback 的 `(prompt, sample_index)` 和小模型通过 prompt ID 查奖励的方式只是测试适配，不是新 API 的要求。N9 当前反例采用快照期望；选择其他所有权方式时，应提供同等可检验的交接保证。
+新 reward callback 使用上游 `RewardRecord`，可直接读取实际生成 tokens；小模型已移除通过 prompt ID 查奖励的旧适配。N9 采用 CPU payload 快照契约，并额外验证源迭代器、生成缓冲区和 reward 内部的后续修改不会污染训练 rows。
 
-实现对应接口后，从仓库根目录运行：
+从仓库根目录运行；这里使用已准备的验证 venv，环境准备及完整对照命令见 TODO：
 
 ```bash
-python3 tests/async_policy_validation/run.py --output-dir runs/async-policy-rewrite/check
-python3 tests/async_policy_validation/run.py --include-semantics-probe --case stale_loss --output-dir runs/async-policy-rewrite/loss-diagnostic
+runs/async-policy-rewrite/venv/bin/python tests/async_policy_validation/run.py --include-core --output-dir runs/async-policy-rewrite/check
+runs/async-policy-rewrite/venv/bin/python tests/async_policy_validation/run.py --include-semantics-probe --case stale_loss --output-dir runs/async-policy-rewrite/loss-diagnostic
 ```
 
-第二条诊断预期显示既定目标与另一目标的差异，并可能非零退出。新运行记录自己的 SHA、环境和输出目录；不放松断言 / 容差来修绿，不用过去的 85 项常规通过或历史数值对照代替新实现验证。
+第二条诊断预期显示既定目标与另一目标的差异，本次实际非零退出。新运行记录自己的 SHA、环境和输出目录；不放松断言 / 容差来修绿，不用历史通过状态代替新实现验证。
