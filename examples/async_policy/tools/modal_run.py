@@ -18,22 +18,15 @@ BASELINE_SHA = "48d07c54051c41bf36218f99bce1c3697e9ba63c"
 
 
 def collect_artifacts(output: Path, destination: Path, *, reports_only: bool) -> bytes:
-    """Keep the complete archive on disk; optionally return only small reports."""
-    import io
+    """Archive a small run or its reports; large checkpoints stay in the volume."""
     import tarfile
 
     paths = sorted(path for path in output.rglob("*") if path.is_file())
     with tarfile.open(destination, mode="w:gz", compresslevel=1) as archive:
         for path in paths:
-            archive.add(path, arcname=str(path.relative_to(output)))
-    if not reports_only:
-        return destination.read_bytes()
-    packed = io.BytesIO()
-    with tarfile.open(fileobj=packed, mode="w:gz", compresslevel=1) as archive:
-        for path in paths:
-            if path.suffix not in {".safetensors", ".pt", ".bin"}:
+            if not reports_only or path.suffix not in {".safetensors", ".pt", ".bin"}:
                 archive.add(path, arcname=str(path.relative_to(output)))
-    return packed.getvalue()
+    return destination.read_bytes()
 
 
 def main() -> int:
@@ -149,7 +142,11 @@ def main() -> int:
             return {"return_code": 0, "phase": phase, "source_sha": source_sha, **metadata}
 
         model = json.loads((storage / "model.json").read_text())
-        output = workspace / "runs" / "async-policy-rewrite" / "gpu" / f"{phase}-{source_sha[:12]}-{run_id}"
+        reports_only = phase in {"full", "resume-full", "reevaluate"}
+        # Write large checkpoints directly to durable storage. Compressing tens
+        # of GB after training can consume the entire GPU task timeout.
+        output_root = storage if reports_only else workspace / "runs" / "async-policy-rewrite" / "gpu"
+        output = output_root / f"{phase}-{source_sha[:12]}-{run_id}"
         output.mkdir(parents=True, exist_ok=True)
         command = [
             sys.executable, "examples/async_policy/tools/gpu_run.py", "--mode", phase,
@@ -188,10 +185,11 @@ def main() -> int:
         if phase == "example":
             command = [sys.executable, "examples/async_policy/tools/example_run.py",
                        "--model-path", model["model_path"], "--output-dir", str(output)]
-        archive_path = storage / f"{phase}-{source_sha}-{run_id}.tar.gz"
-        reports_only = phase in {"full", "resume-full", "reevaluate"}
+        archive_suffix = ".reports.tar.gz" if reports_only else ".tar.gz"
+        archive_path = storage / f"{phase}-{source_sha}-{run_id}{archive_suffix}"
         metadata = {"command": command, "source_sha": source_sha, "phase": phase,
                     "run_id": run_id, "gpu_request": gpu_request, "volume_artifact": archive_path.name,
+                    "volume_output_dir": output.name if reports_only else None,
                     "downloaded_artifact_scope": "reports" if reports_only else "all"}
         started = time.monotonic()
         process = None
@@ -217,8 +215,7 @@ def main() -> int:
         sys.path.insert(0, str(workspace))
         from examples.async_policy.tools.modal_run import collect_artifacts
 
-        # Full optimizer checkpoints can exceed host RAM when buffered together.
-        # Keep all evidence in the volume and return reports for full-model runs.
+        # Full-model evidence is already in the volume; only archive reports.
         artifact = collect_artifacts(output, archive_path, reports_only=reports_only)
         volume.commit()
         return {**metadata, "artifact": artifact}

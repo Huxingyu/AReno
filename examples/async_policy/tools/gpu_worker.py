@@ -100,3 +100,31 @@ class ObservedWorker(ArenoWorker):
         if payload.version == 1 and os.environ.get("ARENO_R4_FAULT") == "receive":
             raise RuntimeError("injected native policy receiver failure at version 1")
         return super().receive_policy(payload)
+
+
+class ResumeAuditWorker(ObservedWorker):
+    """Hash the live checkpoint boundary before any resumed training occurs."""
+
+    def __init__(self, config):
+        torch.manual_seed(41)
+        super().__init__(config)
+
+    def _audit_resume(self, operation):
+        from areno.engine.modeling import unwrap_model
+        from examples.async_policy.tools.resume_run import state_fingerprints
+
+        state = {"global_step": self._global_step,
+                 "model": state_fingerprints(unwrap_model(self.model).state_dict()),
+                 "cpu_rng": state_fingerprints(torch.get_rng_state()),
+                 "cuda_rng": state_fingerprints(torch.cuda.get_rng_state(self.device)),
+                 "optimizer": state_fingerprints(self.optimizer.state_dict())}
+        path = self._observation_dir / f"resume-audit-{operation}-{self._global_step}.json"
+        path.write_text(json.dumps(state, indent=2) + "\n")
+
+    def handle(self, command):
+        if command.op is Op.TRAIN and self._global_step == 0:
+            self._audit_resume("before_train")
+        result = super().handle(command)
+        if self.config.role == "train" and command.op in {Op.SAVE_CHECKPOINT, Op.LOAD_TRAINING_STATE}:
+            self._audit_resume(command.op.name.lower())
+        return result
