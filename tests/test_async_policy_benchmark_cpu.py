@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from examples.async_policy.tools.benchmark_run import case_plan, measure, parse_args, quality_metrics
+from examples.async_policy.tools.benchmark_run import case_plan, generation_window, measure, parse_args, quality_metrics
 from examples.async_policy.tools.matrix import build_jobs, summarize
 from examples.async_policy.tools.modal_run import collect_artifacts
 
@@ -39,6 +39,31 @@ def test_quality_metrics_keep_accuracy_length_and_limit_hits_separate():
     assert result["accuracy"] == result["token_limit_hit_rate"] == 0.5
     assert result["mean_response_tokens"] == 47
     assert quality_metrics(rows, 256)["token_limit_hits"] == 0
+
+
+def test_generation_counts_exclude_warmup_and_boundary_requests():
+    def request(start, end, tokens):
+        return {"kind": "rollout", "ok": True, "start_ns": start * 10**9, "end_ns": end * 10**9,
+                "inference": {"returned_response_tokens": tokens - 2, "response_rows": 2,
+                              "stages": {
+                                  "prefill": {"calls": 1, "cpu_s": 0.2, "cuda_s": 0.1,
+                                              "sampled_tokens": 2, "input_tokens": 80},
+                                  "decode": {"calls": 2, "cpu_s": 0.5, "cuda_s": 0.4,
+                                             "sampled_tokens": tokens - 2, "input_tokens": 0}}}}
+
+    rows = [request(0, 9, 9999), request(9, 11, 999), request(11, 14, 50),
+            request(17, 20, 100), request(19, 21, 888), request(20, 22, 9999)]
+    result = generation_window(rows, 10 * 10**9, 20 * 10**9)
+    assert result["available"] and result["complete_requests"] == 2
+    assert result["boundary_requests_excluded"] == 2
+    assert result["sampled_tokens"] == 150 and result["sampled_tokens_per_s"] == 15
+    assert result["returned_response_tokens"] == 146 and result["response_rows"] == 4
+    assert result["stages"]["prefill"]["input_tokens"] == 160
+    assert result["stages"]["decode"]["cuda_s"] == pytest.approx(0.8)
+
+
+def test_legacy_worker_logs_do_not_report_zero_generation():
+    assert generation_window([{"kind": "rollout", "start_ns": 1, "end_ns": 2}], 0, 3) == {"available": False}
 
 
 def test_quality_matrix_keeps_training_and_evaluation_budgets_independent():

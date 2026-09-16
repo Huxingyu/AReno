@@ -181,6 +181,29 @@ def evaluate(model_path: str, data_path: Path, output: Path, adapter: Path | Non
         trainer.close()
 
 
+def generation_window(workers: list[dict], start: int, end: int) -> dict:
+    """Count generated work independently of whether it reached training."""
+    rollouts = [row for row in workers if row["kind"] == "rollout" and row.get("ok", True)]
+    inside = [row for row in rollouts if start <= row["start_ns"] and row["end_ns"] <= end]
+    boundary = [row for row in rollouts if max(start, row["start_ns"]) < min(end, row["end_ns"])
+                and (row["start_ns"] < start or row["end_ns"] > end)]
+    if not inside or any("inference" not in row for row in inside):
+        return {"available": False}
+    stages = {}
+    for row in inside:
+        for name, observed in row["inference"]["stages"].items():
+            stage = stages.setdefault(name, {key: 0 for key in observed})
+            for key, value in observed.items():
+                stage[key] += value
+    tokens = sum(stage["sampled_tokens"] for stage in stages.values())
+    return {"available": True, "window_policy": "Only complete rollout RPCs fully inside the measured window",
+            "complete_requests": len(inside), "boundary_requests_excluded": len(boundary),
+            "sampled_tokens": tokens, "sampled_tokens_per_s": tokens / ((end - start) / 1e9),
+            "returned_response_tokens": sum(row["inference"]["returned_response_tokens"] for row in inside),
+            "response_rows": sum(row["inference"]["response_rows"] for row in inside), "stages": stages,
+            "timing_interpretation": "CPU and CUDA stage intervals overlap; do not add them as wall time."}
+
+
 def measure(summary: dict, output: Path, monitor: Monitor, *, warmup: int = 5) -> dict:
     events = [row for row in summary["updates"] if row["stepped"]]
     if not 1 <= warmup < len(events):
@@ -233,6 +256,11 @@ def measure(summary: dict, output: Path, monitor: Monitor, *, warmup: int = 5) -
             "gpu": gpus, "monitor_samples": len(samples), "monitor_errors": monitor.errors,
             "mean_process_cpu_percent": statistics.mean(row["cpu_percent"] for row in samples),
             "peak_summed_process_rss_bytes": max(row["summed_process_rss_bytes"] for row in samples),
+            "generation": generation_window(workers, start, end),
+            "peak_cuda_allocated_bytes": {
+                role: max((row.get("max_allocated_bytes", 0) for row in workers if row["role"] == role
+                           and max(start, row["start_ns"]) < min(end, row["end_ns"])), default=0)
+                for role in ("train", "rollout")},
             "worker_stage_seconds": stage_seconds, "sync_model_overlap_violations": 0}
 
 
