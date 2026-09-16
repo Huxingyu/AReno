@@ -23,7 +23,7 @@ def stop_owned_app(app_id: str | None, name: str) -> dict:
                  if row.get("app_id") == app_id or row.get("description") == name]
         for row in owned:
             if row.get("state") != "stopped" or int(row.get("tasks", 0)):
-                result = subprocess.run([*prefix, "stop", row["app_id"]], capture_output=True,
+                result = subprocess.run([*prefix, "stop", "--yes", row["app_id"]], capture_output=True,
                                         text=True, timeout=30)
                 if result.returncode:
                     errors.append(result.stderr[-2000:])
