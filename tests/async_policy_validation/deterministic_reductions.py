@@ -67,7 +67,9 @@ def embedding_case(dtype, rows, hidden):
         output = areno_vocab_embedding(ids, weight, 8, 40)
         return output, *torch.autograd.grad(output, weight, grad)
 
-    output, gradient = operation()
+    # Release the eager graph before capture. Keeping its output alive also
+    # keeps the leaf's eager-stream AccumulateGrad node alive across streams.
+    output, gradient = (value.detach() for value in operation())
     torch.testing.assert_close(output.cpu(), reference.detach(), rtol=0, atol=0)
     # FP16/BF16 references round once after FP64 accumulation. The CUDA path
     # accumulates in FP32; allow two rounding units, independently of equality.
@@ -117,7 +119,7 @@ def norm_case(dtype, rows, hidden, variant):
             output = areno_rmsnorm(x, weight, 1e-6)
         return output, *torch.autograd.grad(output, inputs, grad)
 
-    output, *gradients = operation()
+    output, *gradients = (value.detach() for value in operation())
     tolerance = {torch.float32: 3e-5, torch.float16: 3e-3, torch.bfloat16: 2e-2}[dtype]
     torch.testing.assert_close(output.cpu(), reference.detach(), rtol=tolerance, atol=tolerance)
     for actual, target in zip(gradients, expected, strict=True):
