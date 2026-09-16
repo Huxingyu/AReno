@@ -20,6 +20,7 @@ from .contracts import (
     PipelineClosed,
     PipelineReport,
     RolloutEngine,
+    RolloutSession,
     ShutdownTimeout,
     SyncMetric,
     TrainEngine,
@@ -89,26 +90,41 @@ class AsyncPolicyPipeline:
     def abort(self) -> None:
         self._supervisor.stop("aborted")
 
+    def _publish_group(self, prompt: AsyncPrompt, session: RolloutSession, batch_id: str) -> None:
+        rewards = score_prompt_group(
+            prompt, session.result, self._reward_fn, decode=self._decode,
+            check_running=self._supervisor.check_running,
+        )
+        batch = build_batch_envelope(
+            run_id=self._run_id, batch_id=batch_id, epoch=0, policy_version=session.policy_version,
+            prompt_items=[prompt], rollout_results=[session.result], rewards=rewards,
+            eos_token_id=self._eos_token_id,
+        )
+        self._supervisor.check_running()
+        self._queue.put(batch)
+
     def _production_task(self, prompt: AsyncPrompt, batch_id: str) -> None:
         try:
             self._supervisor.check_running()
-            session = self._bridge.rollout_session(prompt)
-            rewards = score_prompt_group(
-                prompt, session.result, self._reward_fn, decode=self._decode,
-                check_running=self._supervisor.check_running,
-            )
-            batch = build_batch_envelope(
-                run_id=self._run_id, batch_id=batch_id, epoch=0, policy_version=session.policy_version,
-                prompt_items=[prompt], rollout_results=[session.result], rewards=rewards,
-                eos_token_id=self._eos_token_id,
-            )
-            self._supervisor.check_running()
-            self._queue.put(batch)
+            self._publish_group(prompt, self._bridge.rollout_session(prompt), batch_id)
         except BaseException as exc:
             if not isinstance(exc, PipelineClosed) or not self.stop_event.is_set():
                 self._supervisor.fail(exc)
         finally:
             self._inflight.release()
+
+    def _production_batch_task(self, groups: tuple[tuple[AsyncPrompt, str], ...]) -> None:
+        try:
+            self._supervisor.check_running()
+            sessions = self._bridge.rollout_sessions(tuple(prompt for prompt, _ in groups))
+            for (prompt, batch_id), session in zip(groups, sessions, strict=True):
+                self._publish_group(prompt, session, batch_id)
+        except BaseException as exc:
+            if not isinstance(exc, PipelineClosed) or not self.stop_event.is_set():
+                self._supervisor.fail(exc)
+        finally:
+            for _ in groups:
+                self._inflight.release()
 
     def _produce(self) -> None:
         executor = None
@@ -121,25 +137,42 @@ class AsyncPolicyPipeline:
             index = 0
             while not self.stop_event.is_set():
                 self._inflight.acquire()
+                permits = 1
                 submitted = False
                 try:
                     self._supervisor.check_running()
                     if iterator is None:
                         iterator = iter(self._source)
-                    try:
-                        prompt = next(iterator)
-                    except StopIteration:
-                        exhausted = True
+                    groups = []
+                    for group_index in range(self._config.rollout_batch_groups):
+                        if group_index:
+                            if not self._inflight.try_acquire():
+                                break
+                            permits += 1
+                        try:
+                            prompt = next(iterator)
+                        except StopIteration:
+                            exhausted = True
+                            self._inflight.release()
+                            permits -= 1
+                            break
+                        groups.append((snapshot_prompt(prompt), f"{self._run_id}:{index}"))
+                        index += 1
+                    if not groups:
                         break
-                    owned_prompt = snapshot_prompt(prompt)
                     self._supervisor.check_running()
                     # At most K futures exist: a permit spans read, submit, work and put.
-                    executor.submit(self._production_task, owned_prompt, f"{self._run_id}:{index}")
+                    if self._config.rollout_batch_groups == 1:
+                        executor.submit(self._production_task, *groups[0])
+                    else:
+                        executor.submit(self._production_batch_task, tuple(groups))
                     submitted = True
-                    index += 1
                 finally:
                     if not submitted:
-                        self._inflight.release()
+                        for _ in range(permits):
+                            self._inflight.release()
+                if exhausted:
+                    break
         except BaseException as exc:
             if not isinstance(exc, PipelineClosed) or not self.stop_event.is_set():
                 self._supervisor.fail(exc)

@@ -17,7 +17,7 @@ Two stages and one weight owner
 
 .. code-block:: text
 
-   Production: at most K tasks
+   Production: at most K prompt groups
    read prompt -> rollout GPU -> CPU reward + group advantages -> ready queue Q
                                                                   |
    Training:                                                     v
@@ -57,7 +57,10 @@ Configuration and units
      - Ready prompt-group batches waiting for training.
    * - ``max_inflight_rollouts`` (K)
      - 1
-     - Production tasks, from reading a prompt through publishing its batch.
+     - Prompt groups, from reading a prompt through publishing its batch.
+   * - ``rollout_batch_groups``
+     - 1
+     - Maximum complete groups in one generation session; cannot exceed K.
    * - ``weight_sync_interval_updates`` (C)
      - 1
      - Successful optimizer updates since the last weight copy.
@@ -77,9 +80,24 @@ Configuration and units
      - 0.05
      - Seconds between consumer queue polls.
 
-K includes tasks doing CPU scoring or waiting to publish. Increasing it does
+K includes groups doing CPU scoring or waiting to publish. Increasing it does
 not enable concurrent GPU generation sessions. Queue and inflight bounds limit
 batch counts, not bytes; longer responses or more samples still use more memory.
+
+With ``rollout_batch_groups > 1``, the adapter implements
+``BatchedRolloutEngine.generate_batch`` and returns a dictionary keyed by each
+group's input position. One session captures one policy version for all groups.
+The bridge validates and copies every result before releasing its lease. Each
+group is then scored independently and published as one training batch, with
+the original optimizer-update boundary. Group identity is positional, so repeated
+prompt IDs and texts do not merge groups.
+
+The producer packs only permits that are immediately available. It submits a
+partial batch at EOF or when no additional permit is available; it never waits
+to fill a batch while holding the generation lease. The source iterator must
+still be cooperative. Synchronization retains priority over the next session.
+Packing may change sampling RNG consumption, staleness and the update trajectory;
+compare quality as well as throughput before enabling it for a workload.
 
 Staleness and the loss
 ----------------------

@@ -63,7 +63,8 @@ def training_settings(args, case: dict) -> dict:
             "learning_rate", "attn_backend", "queue_capacity", "max_inflight_rollouts",
             "weight_sync_interval_updates")
     return {**{key: getattr(args, key) for key in keys}, "loss": case["loss"],
-            "lag": case["lag"], "mode": case["mode"]}
+            "lag": case["lag"], "mode": case["mode"],
+            "rollout_batch_groups": getattr(args, "rollout_batch_groups", 1)}
 
 
 class Monitor:
@@ -289,6 +290,7 @@ def parse_args(argv=None):
     parser.add_argument("--queue-capacity", type=positive_int, default=2)
     parser.add_argument("--max-inflight-rollouts", type=positive_int, default=1)
     parser.add_argument("--weight-sync-interval-updates", type=positive_int, default=1)
+    parser.add_argument("--rollout-batch-groups", type=positive_int, default=1)
     parser.add_argument("--lag", type=int, default=1, help="Lag for lag1/offpolicy cases; zero control stays zero")
     parser.add_argument("--dry-run", action="store_true", help="Print the cases without importing GPU workers")
     parser.add_argument("--train-only", action="store_true",
@@ -298,6 +300,10 @@ def parse_args(argv=None):
         parser.error("require 0 < warmup < steps and lag >= 0")
     if args.loss != "grpo" and "offpolicy" in args.cases:
         parser.error("the offpolicy case is a GRPO ablation")
+    if args.rollout_batch_groups > args.max_inflight_rollouts:
+        parser.error("--rollout-batch-groups cannot exceed --max-inflight-rollouts")
+    if "sync" in args.cases and args.rollout_batch_groups != 1:
+        parser.error("the sync control requires --rollout-batch-groups 1")
     if len(set(args.cases)) != len(args.cases) or len(set(args.eval_max_new_tokens)) != len(args.eval_max_new_tokens):
         parser.error("cases and evaluation token limits must be unique")
     return args
@@ -359,7 +365,8 @@ def main(argv=None) -> int:
                                    learning_rate=args.learning_rate, n_samples=args.n_samples,
                                    max_new_tokens=args.max_new_tokens, loss=case["loss"],
                                    queue_capacity=args.queue_capacity, max_inflight_rollouts=args.max_inflight_rollouts,
-                                   weight_sync_interval_updates=args.weight_sync_interval_updates)
+                                   weight_sync_interval_updates=args.weight_sync_interval_updates,
+                                   rollout_batch_groups=args.rollout_batch_groups)
         finally:
             monitor.finish()
         assert summary["ok"]

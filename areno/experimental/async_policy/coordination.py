@@ -167,6 +167,17 @@ class InflightLimiter:
                     return
                 deadline.wait(self._cond)
 
+    def try_acquire(self) -> bool:
+        """Reserve another group without waiting for a batch to fill."""
+        with self._cond:
+            if self._closed:
+                raise InflightClosed("production admission is closed")
+            if self._active == self._capacity:
+                return False
+            self._active += 1
+            self._peak = max(self._peak, self._active)
+            return True
+
     def release(self) -> None:
         with self._cond:
             if self._active == 0:

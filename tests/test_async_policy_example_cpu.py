@@ -44,6 +44,7 @@ def test_example_default_parameters():
     assert (args.attn_backend, args.loss, args.lora_rank, args.lora_alpha) == ("native", "grpo", 8, 16)
     assert (args.learning_rate, args.n_samples, args.max_new_tokens) == (1e-5, 4, 64)
     assert (args.queue_capacity, args.max_inflight_rollouts, args.weight_sync_interval_updates) == (2, 1, 1)
+    assert args.rollout_batch_groups == 1
 
 
 def test_cli_preserves_model_reference_and_forwards_experiment_parameters(monkeypatch, tmp_path):
@@ -63,7 +64,7 @@ def test_cli_preserves_model_reference_and_forwards_experiment_parameters(monkey
                        "--attn-backend", "flash", "--lora-rank", "16", "--lora-alpha", "32",
                        "--learning-rate", "0.0002", "--n-samples", "8", "--max-new-tokens", "256",
                        "--loss", "grpo-offpolicy", "--queue-capacity", "4", "--max-inflight-rollouts", "2",
-                       "--weight-sync-interval-updates", "4"]) == 0
+                       "--weight-sync-interval-updates", "4", "--rollout-batch-groups", "2"]) == 0
     assert received["base_model_reference"] == "Example/AnotherModel"
     assert received["model_path"] == str(tmp_path)
     assert (received["lora_rank"], received["lora_alpha"], received["learning_rate"]) == (16, 32, 0.0002)
@@ -71,10 +72,13 @@ def test_cli_preserves_model_reference_and_forwards_experiment_parameters(monkey
     assert (received["queue_capacity"], received["max_inflight_rollouts"],
             received["weight_sync_interval_updates"]) == (4, 2, 4)
     assert received["loss"] == "grpo-offpolicy"
+    assert received["rollout_batch_groups"] == 2
 
 
 @pytest.mark.parametrize("arguments", [
     ["--max-new-tokens", "0"], ["--learning-rate", "nan"], ["--lag", "-1"], ["--lora-rank", "0"],
+    ["--rollout-batch-groups", "2"],
+    ["--mode", "sync", "--rollout-batch-groups", "2", "--max-inflight-rollouts", "2"],
 ])
 def test_example_rejects_invalid_parameters_before_resolving_model(arguments):
     with pytest.raises(SystemExit):

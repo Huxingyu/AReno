@@ -9,6 +9,7 @@ from .contracts import (
     AsyncPolicyConfig,
     AsyncPrompt,
     BatchContractError,
+    BatchedRolloutEngine,
     BatchEnvelope,
     BatchMetric,
     BridgeStateError,
@@ -39,7 +40,7 @@ from .pipeline import AsyncPolicyPipeline
 
 __all__ = [
     "AsyncPolicyConfig", "AsyncPolicyPipeline", "AsyncPrompt", "BatchContractError",
-    "BatchEnvelope", "BatchMetric", "BoundedReadyQueue", "BridgeStateError", "DeviceMode",
+    "BatchEnvelope", "BatchedRolloutEngine", "BatchMetric", "BoundedReadyQueue", "BridgeStateError", "DeviceMode",
     "DualEngineBridge", "InflightClosed", "InflightLimiter", "Lifecycle", "PipelineClosed",
     "PipelineReport", "PolicyPipelineCoordinator", "QueueAborted", "QueueEmpty", "QueueFinished",
     "RolloutEngine", "RolloutSession", "ShutdownTimeout", "SyncMetric", "SyncPlan",

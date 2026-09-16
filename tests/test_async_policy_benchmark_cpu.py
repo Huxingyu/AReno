@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from examples.async_policy.tools.benchmark_run import case_plan, generation_window, measure, parse_args, quality_metrics
-from examples.async_policy.tools.matrix import build_jobs, summarize
+from examples.async_policy.tools.matrix import batching_comparisons, build_jobs, summarize
 from examples.async_policy.tools.modal_run import collect_artifacts
 
 
@@ -97,6 +97,34 @@ def test_matrix_size_and_missing_evidence(tmp_path, suite, job_count, run_count)
 def test_benchmark_rejects_missing_measured_window(tmp_path):
     with pytest.raises(ValueError, match="warmup"):
         measure({"updates": [{"stepped": True}]}, tmp_path, SimpleNamespace(), warmup=1)
+
+
+def test_batching_matrix_holds_k_and_training_work_fixed_and_balances_order():
+    jobs = build_jobs(SimpleNamespace(suite="batching", seeds=None, steps=55, warmup=5, attn_backend="native"))
+    assert len(jobs) == len({job["task_id"] for job in jobs}) == 9
+    for seed in (41, 42, 43):
+        selected = [job for job in jobs if job["seed"] == seed]
+        assert {(job["cases"][0], job["rollout_batch_groups"]) for job in selected} == {
+            ("sync", 1), ("lag1", 1), ("lag1", 2)}
+        assert all(job["max_inflight_rollouts"] == 2 and job["n_samples"] == 8
+                   and job["steps"] == 55 and job["eval_max_new_tokens"] == [256] for job in selected)
+    assert jobs[0]["rollout_batch_groups"] == 1
+    assert jobs[3]["rollout_batch_groups"] == 2
+
+
+def test_batch_comparison_refuses_a_different_k_or_lag_control():
+    def row(groups, k=2, lag=1):
+        return {"seed": 41, "training_settings": {"seed": 41, "rollout_batch_groups": groups,
+                "max_inflight_rollouts": k, "lag": lag, "mode": "async"},
+                "metrics": {"updates_per_s": groups},
+                "evaluations": {"256": {"after": {"accuracy": 0.75 + 0.01 * groups}}}}
+
+    invalid = batching_comparisons([row(1, k=1), row(1, lag=4), row(2)])
+    assert not invalid["paired"] and len(invalid["missing_single_group_baselines"]) == 1
+    valid = batching_comparisons([row(1), row(2)])
+    assert not valid["missing_single_group_baselines"]
+    assert valid["paired"][0]["updates_per_s_ratio"] == 2
+    assert valid["paired"][0]["accuracy_delta_by_eval_limit"]["256"] == pytest.approx(0.01)
 
 
 @pytest.mark.parametrize("reports_only", [False, True])
