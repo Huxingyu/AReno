@@ -380,7 +380,7 @@ def main() -> int:
         remote = app.function(name="prepare", cpu=(4, 4), memory=(16384, 16384), timeout=task_timeout, **resources)(run_remote)
     else:
         remote = app.function(name="evaluate" if args.phase in {"reevaluate", "checkpoint-eval"} else "dual_l4_test",
-                              gpu=gpu_request, cpu=(4, 4), memory=(16384, 16384),
+                              gpu=gpu_request, cpu=(4, 4), memory=(32768, 32768),
                               timeout=task_timeout, startup_timeout=300, **resources)(run_remote)
     with modal.enable_output():
         result = invoke(app, remote, (args.phase, sha, branch, remote_url, args.benchmark_args, run_id),
