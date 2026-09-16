@@ -215,7 +215,8 @@ def main() -> int:
             kernel_key = hashlib.sha256(tree).hexdigest()
             cache = storage / "compiled-kernels" / kernel_key
             metadata_path = cache / "build.json"
-            if phase == "prepare-kernels":
+            cache_hit = metadata_path.is_file()
+            if phase == "prepare-kernels" and not cache_hit:
                 cache.mkdir(parents=True, exist_ok=True)
                 try:
                     with (output / "kernel-build.log").open("x") as log:
@@ -230,12 +231,11 @@ def main() -> int:
                 binary = cache / extensions[0].name
                 shutil.copy2(extensions[0], binary)
                 metadata = {"source_sha": source_sha, "kernel_sha256": kernel_key,
-                            "torch": torch.__version__, "cuda": torch.version.cuda,
+                            "torch": str(torch.__version__), "cuda": torch.version.cuda,
                             "architecture": os.environ["TORCH_CUDA_ARCH_LIST"],
                             "binary": binary.name, "binary_sha256": sha256_file(binary)}
                 write_json(metadata_path, metadata)
                 volume.commit()
-                return {"return_code": 0, "phase": phase, "kernel_build": metadata}
             if phase == "regression":
                 raise RuntimeError("kernel regression needs independent baseline/candidate extensions")
             if not metadata_path.is_file():
@@ -247,6 +247,10 @@ def main() -> int:
                     or metadata["architecture"] != os.environ["TORCH_CUDA_ARCH_LIST"]
                     or sha256_file(binary) != metadata["binary_sha256"]):
                 raise RuntimeError("cached CUDA extension does not match this source and runtime")
+            if phase == "prepare-kernels":
+                # Read JSON primitives so the controller needs no Torch import
+                # when Modal deserializes torch.torch_version.TorchVersion.
+                return {"return_code": 0, "phase": phase, "kernel_build": metadata, "cache_hit": cache_hit}
             shutil.copy2(binary, workspace / "areno/accel" / binary.name)
         elif phase == "prepare-kernels":
             return {"return_code": 0, "phase": phase, "kernel_build": "unchanged baseline image"}
