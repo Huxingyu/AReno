@@ -118,15 +118,15 @@ def summarize(jobs: list[dict], output: Path) -> dict:
     expected_train_hash = sha256_file(ROOT / "examples/async_policy/train.jsonl")
     expected_questions = len((ROOT / "examples/async_policy/eval128.jsonl").read_text().splitlines())
     for job in jobs:
+        attempts = sorted((output / job["name"]).glob("*/attempt-*/attempt.json"))
+        for path in attempts:
+            state = json.loads(path.read_text())
+            if state["status"] != "succeeded":
+                failures.append({"job": job["name"], "attempt": str(path.relative_to(output)),
+                                 "status": state["status"]})
         attempt = completed_attempt(output / job["name"] / "evaluate")
         if attempt is None:
             missing.append(job["name"])
-            attempts = sorted((output / job["name"]).glob("*/attempt-*/attempt.json"))
-            for path in attempts:
-                state = json.loads(path.read_text())
-                if state["status"] != "succeeded":
-                    failures.append({"job": job["name"], "attempt": str(path.relative_to(output)),
-                                     "status": state["status"]})
             continue
         path = attempt / "artifacts/result.json"
         result = json.loads(path.read_text())
