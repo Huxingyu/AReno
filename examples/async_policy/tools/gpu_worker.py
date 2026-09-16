@@ -112,16 +112,26 @@ class ResumeAuditWorker(ObservedWorker):
         super().__init__(config)
 
     def _audit_resume(self, operation):
-        from areno.engine.modeling import unwrap_model
-        from examples.async_policy.tools.resume_run import state_fingerprints
+        import resource
 
+        from areno.engine.modeling import unwrap_model
+        from examples.async_policy.tools.resume_run import optimizer_fingerprints, state_fingerprints
+
+        path = self._observation_dir / f"resume-audit-{operation}-{self._global_step}.json"
+        started = time.monotonic()
+        progress = path.with_name(path.stem + "-progress.json")
+        progress.write_text(json.dumps({"stage": "model", "started_ns": time.time_ns()}) + "\n")
         state = {"global_step": self._global_step,
                  "model": state_fingerprints(unwrap_model(self.model).state_dict()),
                  "cpu_rng": state_fingerprints(torch.get_rng_state()),
-                 "cuda_rng": state_fingerprints(torch.cuda.get_rng_state(self.device)),
-                 "optimizer": state_fingerprints(self.optimizer.state_dict())}
-        path = self._observation_dir / f"resume-audit-{operation}-{self._global_step}.json"
+                 "cuda_rng": state_fingerprints(torch.cuda.get_rng_state(self.device))}
+        model_s = time.monotonic() - started
+        progress.write_text(json.dumps({"stage": "optimizer", "model_s": model_s}) + "\n")
+        state["optimizer"] = optimizer_fingerprints(self.optimizer)
         path.write_text(json.dumps(state, indent=2) + "\n")
+        progress.write_text(json.dumps({"stage": "complete", "model_s": model_s,
+                                       "total_s": time.monotonic() - started,
+                                       "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024}) + "\n")
 
     def handle(self, command):
         if command.op is Op.TRAIN and self._global_step == 0:

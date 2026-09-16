@@ -29,6 +29,31 @@ def state_fingerprints(value):
     return value
 
 
+def optimizer_fingerprints(optimizer):
+    """Hash the canonical FP32 state one bucket at a time in this audit tool.
+
+    The native state_dict materializes all CPU master parameters and moments
+    together. Use its exact bucket serialization helpers without retaining the
+    complete multi-GB snapshot. Other optimizer formats keep their own contract.
+    """
+    from areno.engine.optim.adamw_fp32_master import AdamWFP32Master
+
+    if type(optimizer) is not AdamWFP32Master:
+        return state_fingerprints(optimizer.state_dict())
+    result = state_fingerprints({key: getattr(optimizer, key) for key in (
+        "lr", "betas", "weight_decay", "eps", "dp_rank", "dp_size")})
+    result.update(master_params=[], state=[])
+    for index, bucket in enumerate(optimizer.buckets):
+        payload = optimizer._bucket_cpu_payload(index, bucket)
+        result["master_params"].append(state_fingerprints(
+            optimizer._materialize_master_cpu(bucket, payload["master_storage"])))
+        result["state"].append(state_fingerprints({
+            "exp_avg": payload["exp_avg"], "exp_avg_sq": payload["exp_avg_sq"], "step": bucket.step,
+        }))
+        del payload
+    return result
+
+
 def compare_tensors(left, right) -> dict:
     """Measure all differences in bounded chunks, including sparse BF16 drift."""
     import torch
