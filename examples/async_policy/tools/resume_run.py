@@ -61,7 +61,16 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--full-parameters", action="store_true")
     parser.add_argument("--attn-backend", choices=("native", "flash"), default="native")
+    parser.add_argument("--seed", type=int, default=41)
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Enable deterministic PyTorch algorithms and AReno reduction kernels")
+    parser.add_argument("--audit-each-step", action="store_true")
     args = parser.parse_args()
+    os.environ.update(ARENO_RESUME_SEED=str(args.seed),
+                      ARENO_RESUME_DETERMINISTIC="1" if args.deterministic else "0",
+                      ARENO_RESUME_AUDIT_EACH_STEP="1" if args.audit_each_step else "0")
+    if args.deterministic:
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
     from gpu_run import adapter_tensors, make_inputs
     from gpu_worker import ResumeAuditWorker
@@ -95,7 +104,7 @@ def main() -> int:
         os.environ.update(ARENO_R4_OUTPUT=str(output), ARENO_R4_PROFILE="0", ARENO_R4_FAULT="")
         pair = NativeCudaEnginePair(model_path=args.model_path, config=config, tokenizer=tokenizer,
                                    sampling_params=SamplingParams(max_new_tokens=64, max_prompt_len=128),
-                                   worker_cls=ResumeAuditWorker, resume_from=resume)
+                                   worker_cls=ResumeAuditWorker, resume_from=resume, seed=args.seed)
 
         class SavingTrain:
             def initialize(self, *, timeout_s):
@@ -151,6 +160,7 @@ def main() -> int:
     optimizer_equal = final[0]["optimizer"] == final[1]["optimizer"]
     rng_equal = all(final[0][key] == final[1][key] for key in ("cpu_rng", "cuda_rng"))
     result = {"ok": all(boundary.values()) and comparison["exact"] and optimizer_equal and rng_equal,
+              "seed": args.seed, "deterministic": args.deterministic,
               "full_parameters": args.full_parameters, "restore_boundary": boundary,
               "restore_exact": all(boundary.values()), "continuation": comparison,
               "optimizer_state_equal": optimizer_equal, "rng_state_equal": rng_equal, "cases": results}
@@ -163,6 +173,20 @@ def main() -> int:
             "optimizer_state_equal": final[0]["optimizer"] == control_final["optimizer"],
         }
         result["ok"] &= result["independent_control"]["initial_state_equal"]
+        if args.deterministic:
+            result["ok"] &= (result["independent_control"]["comparison"]["exact"]
+                             and result["independent_control"]["optimizer_state_equal"])
+    if args.audit_each_step:
+        result["step_audits"] = {}
+        for step in (1, 2, 3):
+            reference = audit("continuous", "after_train", step)
+            labels = (["control"] if args.full_parameters else []) + (["resumed"] if step > 1 else [])
+            result["step_audits"][str(step)] = {
+                label: {key: reference[key] == audit(label, "after_train", step)[key] for key in reference}
+                for label in labels}
+        if args.deterministic:
+            result["ok"] &= all(all(flags.values()) for step in result["step_audits"].values()
+                                for flags in step.values())
     # Keep exact continuation as a separate, strict gate even when the native
     # continuous control also differs. No tolerance is chosen to hide drift.
     (args.output_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")

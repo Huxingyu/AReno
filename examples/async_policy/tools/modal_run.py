@@ -33,7 +33,7 @@ def collect_artifacts(output: Path, destination: Path, *, reports_only: bool) ->
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("prepare", "baseline", "async", "trace", "faults", "extended-faults", "full", "compiled", "graphs", "regression", "resume", "resume-full", "example", "bench-41", "bench-42", "bench-43", "benchmark", "reevaluate", "checkpoint-eval"), required=True)
+    parser.add_argument("--phase", choices=("prepare", "prepare-kernels", "kernel-check", "checkpoint-inventory", "baseline", "async", "trace", "faults", "extended-faults", "full", "compiled", "graphs", "regression", "resume", "resume-full", "example", "bench-41", "bench-42", "bench-43", "benchmark", "reevaluate", "checkpoint-eval"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true", help="Preview resources without contacting Modal")
     parser.add_argument("--task-timeout-s", type=int, help="Bound one remote task, including artifact collection")
@@ -45,7 +45,7 @@ def main() -> int:
     parser.add_argument("--benchmark-args", nargs=argparse.REMAINDER, default=[],
                         help="Forward benchmark/reevaluation options; place last")
     args = parser.parse_args()
-    if args.benchmark_args and args.phase not in {"benchmark", "reevaluate", "checkpoint-eval", "resume-full"}:
+    if args.benchmark_args and args.phase not in {"benchmark", "reevaluate", "checkpoint-eval", "resume-full", "checkpoint-inventory"}:
         parser.error("forwarded arguments require benchmark, reevaluate, checkpoint-eval or resume-full")
     if args.phase == "benchmark" and ("--seed" not in args.benchmark_args
                                       or any(flag in args.benchmark_args for flag in ("--model-path", "--output-dir"))):
@@ -71,10 +71,11 @@ def main() -> int:
     controller_timeout = args.controller_timeout_s or task_timeout + 300
     if not 30 <= controller_timeout <= 7500:
         parser.error("controller timeout must be between 30 and 7500 seconds")
-    gpu_request = "L4" if args.phase in {"reevaluate", "checkpoint-eval"} else "L4:2"
+    cpu_only = args.phase in {"prepare", "prepare-kernels", "checkpoint-inventory"}
+    gpu_request = "L4" if args.phase in {"reevaluate", "checkpoint-eval", "kernel-check"} else "L4:2"
     root = Path(__file__).resolve().parents[3]
     if args.dry_run:
-        print(json.dumps({"phase": args.phase, "gpu": None if args.phase == "prepare" else gpu_request,
+        print(json.dumps({"phase": args.phase, "gpu": None if cpu_only else gpu_request,
                           "task_timeout_s": task_timeout, "subprocess_timeout_s": subprocess_timeout,
                           "controller_timeout_s": controller_timeout,
                           "benchmark_args": args.benchmark_args, "remote_started": False}, indent=2))
@@ -107,7 +108,7 @@ def main() -> int:
         parser.error("run ID must be a short, safe directory component")
     write_json(args.output_dir / "request.json", {
         "sha": sha, "baseline_sha": BASELINE_SHA, "branch": branch, "phase": args.phase,
-        "gpu": None if args.phase == "prepare" else gpu_request,
+        "gpu": None if cpu_only else gpu_request,
         "gpu_task_timeout_s": task_timeout, "subprocess_timeout_s": subprocess_timeout,
         "controller_timeout_s": controller_timeout,
         "model": "Qwen/Qwen3-0.6B", "model_hub": "modelscope",
@@ -140,6 +141,7 @@ def main() -> int:
         import hashlib
         import json
         import os
+        import shutil
         import signal
         import subprocess
         import sys
@@ -183,15 +185,71 @@ def main() -> int:
         fetched = subprocess.check_output(["git", "rev-parse", "FETCH_HEAD"], cwd=workspace, text=True).strip()
         if fetched != source_sha:
             raise RuntimeError("Remote branch moved; refusing a mismatched source SHA")
-        # Reject a candidate whose CUDA source differs from the built image.
+        # Kernel changes are compiled in a bounded CPU job, then loaded only
+        # from an exact source/runtime/hash match on the GPU host.
         changed_kernels = subprocess.check_output(
             ["git", "diff", BASELINE_SHA, source_sha, "--", "areno/accel", "setup.py"], cwd=workspace, text=True,
         )
-        if changed_kernels:
-            raise RuntimeError("CUDA build inputs changed; rebuild the image before running")
         subprocess.run(["git", "checkout", "--detach", source_sha], cwd=workspace, check=True)
         if subprocess.check_output(["git", "status", "--porcelain"], cwd=workspace, text=True).strip():
             raise RuntimeError("Remote source checkout is dirty")
+        sys.path.insert(0, str(workspace))
+        from examples.async_policy.tools.campaign_state import file_manifest, sha256_file, write_json
+
+        if phase == "checkpoint-inventory":
+            if len(benchmark_args) != 2 or benchmark_args[0] != "--directory":
+                raise ValueError("checkpoint inventory requires --directory and a relative Volume directory")
+            reference = Path(benchmark_args[1])
+            if reference.is_absolute() or ".." in reference.parts:
+                raise ValueError("inventory directory must remain within the Volume")
+            inventory = file_manifest(storage / reference)
+            write_json(output / "inventory.json", inventory)
+            volume.commit()
+            return {"return_code": 0, "phase": phase, "source_sha": source_sha,
+                    "directory": str(reference), "inventory": inventory}
+
+        if changed_kernels:
+            import torch
+
+            tree = subprocess.check_output(["git", "ls-tree", "-r", source_sha, "--", "areno/accel", "setup.py"], cwd=workspace)
+            kernel_key = hashlib.sha256(tree).hexdigest()
+            cache = storage / "compiled-kernels" / kernel_key
+            metadata_path = cache / "build.json"
+            if phase == "prepare-kernels":
+                cache.mkdir(parents=True, exist_ok=True)
+                try:
+                    with (output / "kernel-build.log").open("x") as log:
+                        subprocess.run([sys.executable, "-m", "pip", "install", "-e", ".", "--no-deps", "--no-build-isolation"],
+                                       cwd=workspace, stdout=log, stderr=subprocess.STDOUT, check=True,
+                                       timeout=max(1, deadline_epoch - time.time() - 30))
+                finally:
+                    volume.commit()
+                extensions = list((workspace / "areno/accel").glob("_areno_accel*.so"))
+                if len(extensions) != 1:
+                    raise RuntimeError("expected one freshly built AReno extension")
+                binary = cache / extensions[0].name
+                shutil.copy2(extensions[0], binary)
+                metadata = {"source_sha": source_sha, "kernel_sha256": kernel_key,
+                            "torch": torch.__version__, "cuda": torch.version.cuda,
+                            "architecture": os.environ["TORCH_CUDA_ARCH_LIST"],
+                            "binary": binary.name, "binary_sha256": sha256_file(binary)}
+                write_json(metadata_path, metadata)
+                volume.commit()
+                return {"return_code": 0, "phase": phase, "kernel_build": metadata}
+            if phase == "regression":
+                raise RuntimeError("kernel regression needs independent baseline/candidate extensions")
+            if not metadata_path.is_file():
+                raise RuntimeError("changed CUDA source requires --phase prepare-kernels first")
+            metadata = json.loads(metadata_path.read_text())
+            binary = cache / metadata["binary"]
+            if (metadata["kernel_sha256"] != kernel_key or metadata["torch"] != torch.__version__
+                    or metadata["cuda"] != torch.version.cuda
+                    or metadata["architecture"] != os.environ["TORCH_CUDA_ARCH_LIST"]
+                    or sha256_file(binary) != metadata["binary_sha256"]):
+                raise RuntimeError("cached CUDA extension does not match this source and runtime")
+            shutil.copy2(binary, workspace / "areno/accel" / binary.name)
+        elif phase == "prepare-kernels":
+            return {"return_code": 0, "phase": phase, "kernel_build": "unchanged baseline image"}
 
         if phase == "prepare":
             from modelscope import snapshot_download
@@ -255,6 +313,9 @@ def main() -> int:
         if phase == "example":
             command = [sys.executable, "examples/async_policy/tools/example_run.py",
                        "--model-path", model["model_path"], "--output-dir", str(output)]
+        if phase == "kernel-check":
+            command = [sys.executable, "tests/async_policy_validation/deterministic_reductions.py",
+                       "--output-dir", str(output)]
         archive_suffix = ".reports.tar.gz" if reports_only else ".tar.gz"
         archive_path = storage / f"{phase}-{source_sha}-{run_id}{archive_suffix}"
         metadata = {"command": command, "source_sha": source_sha, "phase": phase,
@@ -311,8 +372,8 @@ def main() -> int:
 
     resources = dict(image=image, volumes={volume_root: volume}, max_containers=1, min_containers=0,
                      scaledown_window=2, retries=0, serialized=True, include_source=False)
-    if args.phase == "prepare":
-        remote = app.function(name="prepare", cpu=(2, 4), memory=(8192, 16384), timeout=task_timeout, **resources)(run_remote)
+    if cpu_only:
+        remote = app.function(name="prepare", cpu=(4, 4), memory=(16384, 16384), timeout=task_timeout, **resources)(run_remote)
     else:
         remote = app.function(name="evaluate" if args.phase in {"reevaluate", "checkpoint-eval"} else "dual_l4_test",
                               gpu=gpu_request, cpu=(4, 4), memory=(16384, 16384),
@@ -320,7 +381,7 @@ def main() -> int:
     with modal.enable_output():
         result = invoke(app, remote, (args.phase, sha, branch, remote_url, args.benchmark_args, run_id),
                         output=args.output_dir, budget=budget, timeout_s=controller_timeout,
-                        gpus=0 if args.phase == "prepare" else 1 if gpu_request == "L4" else 2,
+                        gpus=0 if cpu_only else 1 if gpu_request == "L4" else 2,
                         app_name=app_name)
     artifact = result.pop("artifact", None)
     if artifact is not None:

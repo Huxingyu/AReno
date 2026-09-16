@@ -106,7 +106,9 @@ class ResumeAuditWorker(ObservedWorker):
     """Hash the live checkpoint boundary before any resumed training occurs."""
 
     def __init__(self, config):
-        torch.manual_seed(41)
+        torch.manual_seed(int(os.environ.get("ARENO_RESUME_SEED", "41")))
+        if os.environ.get("ARENO_RESUME_DETERMINISTIC") == "1":
+            torch.use_deterministic_algorithms(True)
         super().__init__(config)
 
     def _audit_resume(self, operation):
@@ -127,4 +129,7 @@ class ResumeAuditWorker(ObservedWorker):
         result = super().handle(command)
         if self.config.role == "train" and command.op in {Op.SAVE_CHECKPOINT, Op.LOAD_TRAINING_STATE}:
             self._audit_resume(command.op.name.lower())
+        if (self.config.role == "train" and command.op is Op.TRAIN
+                and os.environ.get("ARENO_RESUME_AUDIT_EACH_STEP") == "1"):
+            self._audit_resume("after_train")
         return result

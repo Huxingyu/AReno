@@ -46,6 +46,8 @@ def areno_vocab_embedding(
     ``input_ids`` must be int64 on CUDA. ``weight`` is the local shard with
     shape ``(vocab_end - vocab_start, hidden)``. Returns embeddings with shape
     ``(*input_ids.shape, hidden)`` ready for tensor-parallel reduction.
+    With ``torch.use_deterministic_algorithms(True)``, backward uses stable
+    token ordering and fixed-order accumulation instead of atomic updates.
     """
     if not input_ids.is_cuda or not weight.is_cuda:
         raise RuntimeError("areno_vocab_embedding requires CUDA input_ids and weight")

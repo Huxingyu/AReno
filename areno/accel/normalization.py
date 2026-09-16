@@ -6,6 +6,10 @@ where the gain vector may be omitted, and a fused
 and channel scaling in a single CUDA pass. All variants persist a per-row
 ``inv_rms`` tensor across forward/backward so the gradient kernel avoids the
 extra reduction.
+
+When PyTorch deterministic algorithms are enabled, scale gradients use a
+fixed two-pass reduction instead of atomic accumulation. Input and gate
+gradients retain their existing row-local kernels.
 """
 
 import torch
@@ -16,6 +20,11 @@ from areno.accel._extension import extension as _extension
 def _kernel_weight(weight: torch.Tensor) -> torch.Tensor:
     """Cast the gain vector to float32 to match the CUDA kernel expectation."""
     return weight if weight.dtype == torch.float32 else weight.float()
+
+
+def _validate_shape(x: torch.Tensor) -> None:
+    if x.ndim == 0 or x.shape[-1] == 0:
+        raise ValueError("RMSNorm needs a nonempty final dimension")
 
 
 class _RMSNorm(torch.autograd.Function):
@@ -106,6 +115,7 @@ def areno_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Te
     """
     if not x.is_cuda:
         raise RuntimeError("areno_rmsnorm requires CUDA input")
+    _validate_shape(x)
     weight = _kernel_weight(weight)
     return _RMSNorm.apply(x, weight, float(eps))
 
@@ -118,6 +128,7 @@ def areno_optional_scale_rmsnorm(x: torch.Tensor, weight: torch.Tensor | None, e
     """
     if not x.is_cuda:
         raise RuntimeError("areno_optional_scale_rmsnorm requires CUDA input")
+    _validate_shape(x)
     if weight is not None:
         weight = _kernel_weight(weight)
     return _OptionalScaleRMSNorm.apply(x, weight, float(eps))
@@ -132,6 +143,7 @@ def areno_rmsnorm_silu_gate(x: torch.Tensor, gate: torch.Tensor, weight: torch.T
     """
     if not x.is_cuda or not gate.is_cuda:
         raise RuntimeError("areno_rmsnorm_silu_gate requires CUDA input and gate")
+    _validate_shape(x)
     if x.shape != gate.shape:
         raise ValueError(f"input/gate shape mismatch: {tuple(x.shape)} vs {tuple(gate.shape)}")
     weight = _kernel_weight(weight)

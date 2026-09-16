@@ -1,11 +1,14 @@
 #include <ATen/ATen.h>
+#include <ATen/Context.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
 namespace areno_accel {
 
 constexpr int kNormThreads = 1024;
+constexpr int kWeightRowsPerTile = 128;
 
 template <typename scalar_t>
 __device__ __forceinline__ float to_float(scalar_t value) {
@@ -117,7 +120,8 @@ __global__ void rmsnorm_backward_kernel(
     const float* __restrict__ inv_rms,
     scalar_t* __restrict__ grad_input,
     float* __restrict__ grad_weight,
-    int hidden) {
+    int hidden,
+    bool atomic_weight) {
   int row = blockIdx.x;
   int base = row * hidden;
   float inv = inv_rms[row];
@@ -134,7 +138,7 @@ __global__ void rmsnorm_backward_kernel(
     float x = to_float(input[base + col]);
     float w = weight[col];
     grad_input[base + col] = from_float<scalar_t>(inv * (dy * w - x * scale));
-    atomicAdd(grad_weight + col, dy * x * inv);
+    if (atomic_weight) atomicAdd(grad_weight + col, dy * x * inv);
   }
 }
 
@@ -148,7 +152,8 @@ __global__ void rmsnorm_silu_gate_backward_kernel(
     scalar_t* __restrict__ grad_input,
     scalar_t* __restrict__ grad_gate,
     float* __restrict__ grad_weight,
-    int hidden) {
+    int hidden,
+    bool atomic_weight) {
   int row = blockIdx.x;
   int base = row * hidden;
   float inv = inv_rms[row];
@@ -173,7 +178,7 @@ __global__ void rmsnorm_silu_gate_backward_kernel(
     float w = weight[col];
     grad_input[base + col] = from_float<scalar_t>(inv * (dy * w * silu - x * correction));
     grad_gate[base + col] = from_float<scalar_t>(dy * x * inv * w * dsilu);
-    atomicAdd(grad_weight + col, dy * x * inv * silu);
+    if (atomic_weight) atomicAdd(grad_weight + col, dy * x * inv * silu);
   }
 }
 
@@ -186,7 +191,8 @@ __global__ void optional_scale_rmsnorm_backward_kernel(
     scalar_t* __restrict__ grad_input,
     float* __restrict__ grad_weight,
     int hidden,
-    bool use_scale) {
+    bool use_scale,
+    bool atomic_weight) {
   int row = blockIdx.x;
   int base = row * hidden;
   float inv = inv_rms[row];
@@ -204,10 +210,73 @@ __global__ void optional_scale_rmsnorm_backward_kernel(
     float x = to_float(input[base + col]);
     float scale = use_scale ? weight[col] : 1.0f;
     grad_input[base + col] = from_float<scalar_t>(inv * (dy * scale - x * correction));
-    if (use_scale) {
+    if (use_scale && atomic_weight) {
       atomicAdd(grad_weight + col, dy * x * inv);
     }
   }
+}
+
+template <typename scalar_t, bool gated>
+__global__ void rmsnorm_weight_partials_kernel(
+    const scalar_t* __restrict__ grad_output,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ gate,
+    const float* __restrict__ inv_rms,
+    float* __restrict__ partials,
+    int rows,
+    int hidden) {
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  const int tile = blockIdx.y;
+  if (col >= hidden) return;
+  const int begin = tile * kWeightRowsPerTile;
+  const int end = min(rows, begin + kWeightRowsPerTile);
+  float sum = 0.0f;
+  for (int row = begin; row < end; ++row) {
+    const int64_t index = static_cast<int64_t>(row) * hidden + col;
+    float value = to_float(grad_output[index]) * to_float(input[index]) * inv_rms[row];
+    if constexpr (gated) {
+      const float g = to_float(gate[index]);
+      const float sigmoid = 1.0f / (1.0f + expf(-g));
+      value *= g * sigmoid;
+    }
+    sum += value;
+  }
+  partials[static_cast<int64_t>(tile) * hidden + col] = sum;
+}
+
+__global__ void rmsnorm_weight_finish_kernel(
+    const float* __restrict__ partials,
+    float* __restrict__ grad_weight,
+    int tiles,
+    int hidden) {
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (col >= hidden) return;
+  float sum = 0.0f;
+  for (int tile = 0; tile < tiles; ++tile) {
+    sum += partials[static_cast<int64_t>(tile) * hidden + col];
+  }
+  grad_weight[col] = sum;
+}
+
+template <typename scalar_t, bool gated = false>
+void deterministic_weight_gradient(
+    const torch::Tensor& grad_output,
+    const torch::Tensor& input,
+    const torch::Tensor& inv_rms,
+    torch::Tensor& grad_weight,
+    int rows,
+    int hidden,
+    cudaStream_t stream,
+    const scalar_t* gate = nullptr) {
+  const int tiles = (rows + kWeightRowsPerTile - 1) / kWeightRowsPerTile;
+  auto partials = torch::empty({tiles, hidden}, input.options().dtype(torch::kFloat32));
+  constexpr int threads = 256;
+  const int blocks = (hidden + threads - 1) / threads;
+  rmsnorm_weight_partials_kernel<scalar_t, gated><<<dim3(blocks, tiles), threads, 0, stream>>>(
+      grad_output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), gate,
+      inv_rms.data_ptr<float>(), partials.data_ptr<float>(), rows, hidden);
+  rmsnorm_weight_finish_kernel<<<blocks, threads, 0, stream>>>(
+      partials.data_ptr<float>(), grad_weight.data_ptr<float>(), tiles, hidden);
 }
 
 }  // namespace areno_accel
@@ -221,6 +290,7 @@ std::vector<torch::Tensor> areno_rmsnorm_forward_cuda(torch::Tensor input, torch
   int hidden = static_cast<int>(input.size(-1));
   int rows = static_cast<int>(input.numel() / hidden);
   auto inv_rms = torch::empty({rows}, input.options().dtype(torch::kFloat32));
+  if (rows == 0) return {output, inv_rms};
   const at::cuda::OptionalCUDAGuard guard(device_of(input));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, input.scalar_type(), "areno_rmsnorm_forward", [&] {
@@ -248,6 +318,8 @@ std::vector<torch::Tensor> areno_rmsnorm_backward_cuda(
   auto grad_weight = torch::zeros_like(weight);
   int hidden = static_cast<int>(input.size(-1));
   int rows = static_cast<int>(input.numel() / hidden);
+  if (rows == 0) return {grad_input, grad_weight};
+  const bool deterministic = at::globalContext().deterministicAlgorithms();
   const at::cuda::OptionalCUDAGuard guard(device_of(input));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, input.scalar_type(), "areno_rmsnorm_backward", [&] {
@@ -258,8 +330,14 @@ std::vector<torch::Tensor> areno_rmsnorm_backward_cuda(
         inv_rms.data_ptr<float>(),
         grad_input.data_ptr<scalar_t>(),
         grad_weight.data_ptr<float>(),
-        hidden);
+        hidden,
+        !deterministic);
+    if (deterministic) {
+      areno_accel::deterministic_weight_gradient<scalar_t>(
+          grad_output, input, inv_rms, grad_weight, rows, hidden, stream);
+    }
   });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {grad_input, grad_weight};
 }
 
@@ -278,6 +356,7 @@ std::vector<torch::Tensor> areno_optional_scale_rmsnorm_forward_cuda(
   int hidden = static_cast<int>(input.size(-1));
   int rows = static_cast<int>(input.numel() / hidden);
   auto inv_rms = torch::empty({rows}, input.options().dtype(torch::kFloat32));
+  if (rows == 0) return {output, inv_rms};
   const float* weight_ptr = use_scale ? weight.data_ptr<float>() : nullptr;
   const at::cuda::OptionalCUDAGuard guard(device_of(input));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -309,6 +388,7 @@ std::vector<torch::Tensor> areno_rmsnorm_silu_gate_forward_cuda(
   int hidden = static_cast<int>(input.size(-1));
   int rows = static_cast<int>(input.numel() / hidden);
   auto inv_rms = torch::empty({rows}, input.options().dtype(torch::kFloat32));
+  if (rows == 0) return {output, inv_rms};
   const at::cuda::OptionalCUDAGuard guard(device_of(input));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, input.scalar_type(), "areno_rmsnorm_silu_gate_forward", [&] {
@@ -340,6 +420,8 @@ std::vector<torch::Tensor> areno_rmsnorm_silu_gate_backward_cuda(
   auto grad_weight = torch::zeros_like(weight);
   int hidden = static_cast<int>(input.size(-1));
   int rows = static_cast<int>(input.numel() / hidden);
+  if (rows == 0) return {grad_input, grad_gate, grad_weight};
+  const bool deterministic = at::globalContext().deterministicAlgorithms();
   const at::cuda::OptionalCUDAGuard guard(device_of(input));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, input.scalar_type(), "areno_rmsnorm_silu_gate_backward", [&] {
@@ -352,8 +434,14 @@ std::vector<torch::Tensor> areno_rmsnorm_silu_gate_backward_cuda(
         grad_input.data_ptr<scalar_t>(),
         grad_gate.data_ptr<scalar_t>(),
         grad_weight.data_ptr<float>(),
-        hidden);
+        hidden,
+        !deterministic);
+    if (deterministic) {
+      areno_accel::deterministic_weight_gradient<scalar_t, true>(
+          grad_output, input, inv_rms, grad_weight, rows, hidden, stream, gate.data_ptr<scalar_t>());
+    }
   });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {grad_input, grad_gate, grad_weight};
 }
 
@@ -374,6 +462,8 @@ std::vector<torch::Tensor> areno_optional_scale_rmsnorm_backward_cuda(
   auto grad_weight = use_scale ? torch::zeros_like(weight) : torch::empty({0}, input.options().dtype(torch::kFloat32));
   int hidden = static_cast<int>(input.size(-1));
   int rows = static_cast<int>(input.numel() / hidden);
+  if (rows == 0) return {grad_input, grad_weight};
+  const bool deterministic = at::globalContext().deterministicAlgorithms();
   const float* weight_ptr = use_scale ? weight.data_ptr<float>() : nullptr;
   float* grad_weight_ptr = use_scale ? grad_weight.data_ptr<float>() : nullptr;
   const at::cuda::OptionalCUDAGuard guard(device_of(input));
@@ -387,7 +477,13 @@ std::vector<torch::Tensor> areno_optional_scale_rmsnorm_backward_cuda(
         grad_input.data_ptr<scalar_t>(),
         grad_weight_ptr,
         hidden,
-        use_scale);
+        use_scale,
+        !deterministic);
+    if (use_scale && deterministic) {
+      areno_accel::deterministic_weight_gradient<scalar_t>(
+          grad_output, input, inv_rms, grad_weight, rows, hidden, stream);
+    }
   });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {grad_input, grad_weight};
 }
