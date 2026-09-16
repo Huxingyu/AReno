@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -23,7 +24,7 @@ def repeat(operation, repetitions=16):
         exact += all(torch.equal(a, b) for a, b in zip(first, values, strict=True))
         for a, b in zip(first, values, strict=True):
             if a.numel():
-                maximum = max(maximum, float((a.double() - b.double()).abs().max()))
+                maximum = max(maximum, float((a.double() - b.detach().double()).abs().max()))
     return {"comparisons": repetitions - 1, "exact": exact, "max_abs_delta": maximum}
 
 
@@ -134,6 +135,8 @@ def norm_case(dtype, rows, hidden, variant):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--diagnose-graphs", action="store_true")
+    parser.add_argument("--graph-probe", choices=("sort", "torch-embedding", "areno-embedding"))
     args = parser.parse_args()
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     import torch
@@ -144,6 +147,36 @@ def main():
     torch.set_num_threads(4)
     torch.use_deterministic_algorithms(True)
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.diagnose_graphs:
+        probes = []
+        for name in ("sort", "torch-embedding", "areno-embedding"):
+            with (args.output_dir / f"graph-{name}.log").open("w") as log:
+                process = subprocess.run([sys.executable, __file__, "--graph-probe", name,
+                                          "--output-dir", str(args.output_dir)],
+                                         stdout=log, stderr=subprocess.STDOUT, timeout=60)
+            probes.append({"probe": name, "return_code": process.returncode})
+        write_json(args.output_dir / "result.json", {"ok": all(row["return_code"] == 0 for row in probes),
+                                                     "probes": probes})
+        raise SystemExit(0 if all(row["return_code"] == 0 for row in probes) else 1)
+    if args.graph_probe:
+        ids = torch.randint(0, 32, (34,), device="cuda")[::2]
+        weight = torch.randn((32, 66), device="cuda")[:, ::2].requires_grad_()
+        grad = torch.randn((17, 66), device="cuda")[:, ::2]
+
+        def operation():
+            if args.graph_probe == "sort":
+                return torch.sort(ids, stable=True)
+            if args.graph_probe == "torch-embedding":
+                output = torch.nn.functional.embedding(ids, weight)
+            else:
+                from areno.accel.embedding import areno_vocab_embedding
+
+                output = areno_vocab_embedding(ids, weight, 0, 32)
+            return output, *torch.autograd.grad(output, weight, grad)
+
+        repeat(operation)
+        graph_check(operation)
+        return
     rows = []
     for dtype in (torch.float32, torch.float16, torch.bfloat16, torch.float64):
         for shape in ((0, 33), (17, 33), (513, 128)):

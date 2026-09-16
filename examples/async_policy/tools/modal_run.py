@@ -45,7 +45,7 @@ def main() -> int:
     parser.add_argument("--benchmark-args", nargs=argparse.REMAINDER, default=[],
                         help="Forward benchmark/reevaluation options; place last")
     args = parser.parse_args()
-    if args.benchmark_args and args.phase not in {"benchmark", "reevaluate", "checkpoint-eval", "resume-full", "checkpoint-inventory"}:
+    if args.benchmark_args and args.phase not in {"benchmark", "reevaluate", "checkpoint-eval", "resume-full", "checkpoint-inventory", "kernel-check"}:
         parser.error("forwarded arguments require benchmark, reevaluate, checkpoint-eval or resume-full")
     if args.phase == "benchmark" and ("--seed" not in args.benchmark_args
                                       or any(flag in args.benchmark_args for flag in ("--model-path", "--output-dir"))):
@@ -319,7 +319,7 @@ def main() -> int:
                        "--model-path", model["model_path"], "--output-dir", str(output)]
         if phase == "kernel-check":
             command = [sys.executable, "tests/async_policy_validation/deterministic_reductions.py",
-                       "--output-dir", str(output)]
+                       "--output-dir", str(output), *benchmark_args]
         archive_suffix = ".reports.tar.gz" if reports_only else ".tar.gz"
         archive_path = storage / f"{phase}-{source_sha}-{run_id}{archive_suffix}"
         metadata = {"command": command, "source_sha": source_sha, "phase": phase,
