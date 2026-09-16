@@ -45,7 +45,9 @@ def build_jobs(args) -> list[dict]:
         configurations = [(limit, samples, 2, 1, 1, 1) for limit, samples in itertools.product((256, 512), (4, 8))]
         cases = ["sync", "lag1"]
     elif args.suite == "batching":
-        configurations = [(256, 8, 2, 2, 1, 1)]
+        # C=2 lets two grouped updates share one weight copy; C=1 forces a sync
+        # after each group, which serializes the generation gain away.
+        configurations = [(256, 8, 2, 2, 1, 1), (256, 8, 2, 2, 2, 1)]
         cases = ["sync", "lag1"]
     else:
         # Lag=1 would force C=4 to sync after two updates, confounding the scan.
@@ -60,7 +62,9 @@ def build_jobs(args) -> list[dict]:
     if args.suite == "batching":
         paired = []
         for job in jobs:
-            single = {**job, "name": job["name"] + "-g1", "rollout_batch_groups": 1}
+            # The synchronous control ignores C, so it is only paired with C=1.
+            cases = ["lag1"] if job["weight_sync_interval_updates"] != 1 else job["cases"]
+            single = {**job, "name": job["name"] + "-g1", "rollout_batch_groups": 1, "cases": cases}
             batched = {**job, "name": job["name"] + "-g2", "rollout_batch_groups": 2, "cases": ["lag1"]}
             paired.extend([single, batched] if job["seed"] % 2 else [batched, single])
         jobs = paired

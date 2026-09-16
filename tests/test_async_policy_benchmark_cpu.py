@@ -101,11 +101,11 @@ def test_benchmark_rejects_missing_measured_window(tmp_path):
 
 def test_batching_matrix_holds_k_and_training_work_fixed_and_balances_order():
     jobs = build_jobs(SimpleNamespace(suite="batching", seeds=None, steps=55, warmup=5, attn_backend="native"))
-    assert len(jobs) == len({job["task_id"] for job in jobs}) == 9
+    assert len(jobs) == len({job["task_id"] for job in jobs}) == 15
     for seed in (41, 42, 43):
         selected = [job for job in jobs if job["seed"] == seed]
-        assert {(job["cases"][0], job["rollout_batch_groups"]) for job in selected} == {
-            ("sync", 1), ("lag1", 1), ("lag1", 2)}
+        assert {(job["cases"][0], job["rollout_batch_groups"], job["weight_sync_interval_updates"])
+                for job in selected} == {("sync", 1, 1), ("lag1", 1, 1), ("lag1", 2, 1), ("lag1", 1, 2), ("lag1", 2, 2)}
         assert all(job["max_inflight_rollouts"] == 2 and job["n_samples"] == 8
                    and job["steps"] == 55 and job["eval_max_new_tokens"] == [256] for job in selected)
     assert jobs[0]["rollout_batch_groups"] == 1
