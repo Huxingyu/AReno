@@ -20,9 +20,50 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
+from examples.async_policy.tools.campaign_state import (  # noqa: E402
+    complete_directory,
+    file_manifest,
+    training_code_fingerprint,
+    write_json,
+)
+
 
 def write(path: Path, value) -> None:
-    path.write_text(json.dumps(value, indent=2) + "\n")
+    write_json(path, value)
+
+
+def model_manifest(model_path: str) -> dict:
+    root = Path(model_path)
+    files = sorted(path for path in root.iterdir() if path.is_file()
+                   and (path.suffix in {".json", ".safetensors", ".bin", ".model", ".tiktoken"}
+                        or path.name == "merges.txt"))
+    if not any(path.suffix in {".safetensors", ".bin"} for path in files):
+        raise ValueError("model fingerprint requires local model weights")
+    return file_manifest(root, files)
+
+
+def environment_metadata() -> dict:
+    import torch
+
+    packages = {}
+    for name in ("transformers", "modelscope", "flash-attn", "safetensors"):
+        try:
+            packages[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            packages[name] = None
+    devices = subprocess.check_output([
+        "nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader",
+    ], text=True)
+    return {"python": sys.version.split()[0], "torch": torch.__version__, "cuda": torch.version.cuda,
+            "packages": packages, "gpu_types": sorted(set(devices.strip().splitlines()))}
+
+
+def training_settings(args, case: dict) -> dict:
+    keys = ("seed", "steps", "warmup", "max_new_tokens", "n_samples", "lora_rank", "lora_alpha",
+            "learning_rate", "attn_backend", "queue_capacity", "max_inflight_rollouts",
+            "weight_sync_interval_updates")
+    return {**{key: getattr(args, key) for key in keys}, "loss": case["loss"],
+            "lag": case["lag"], "mode": case["mode"]}
 
 
 class Monitor:
@@ -222,6 +263,8 @@ def parse_args(argv=None):
     parser.add_argument("--weight-sync-interval-updates", type=positive_int, default=1)
     parser.add_argument("--lag", type=int, default=1, help="Lag for lag1/offpolicy cases; zero control stays zero")
     parser.add_argument("--dry-run", action="store_true", help="Print the cases without importing GPU workers")
+    parser.add_argument("--train-only", action="store_true",
+                        help="Persist training and checkpoints immediately; evaluate them in a separate job")
     args = parser.parse_args(argv)
     if args.warmup >= args.steps or args.lag < 0:
         parser.error("require 0 < warmup < steps and lag >= 0")
@@ -258,31 +301,22 @@ def main(argv=None) -> int:
     if (args.output_dir / "environment.json").exists():
         raise FileExistsError("use a fresh benchmark output directory")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    import torch
-
-    packages = {}
-    for name in ("transformers", "modelscope", "flash-attn"):
-        try:
-            packages[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            packages[name] = None
-    write(args.output_dir / "environment.json", {
-        "python": sys.version, "torch": torch.__version__, "cuda": torch.version.cuda,
-        "packages": packages,
-        "devices": subprocess.check_output(["nvidia-smi", "--query-gpu=name,uuid,driver_version,memory.total",
-                                             "--format=csv,noheader"], text=True),
-    })
+    environment = environment_metadata()
+    write(args.output_dir / "environment.json", environment)
     write(args.output_dir / "settings.json", {key: str(value) if isinstance(value, Path) else value
                                               for key, value in vars(args).items()})
     dataset_digests = {"train": hashlib.sha256(args.data_path.read_bytes()).hexdigest(),
                        "eval": hashlib.sha256(args.eval_path.read_bytes()).hexdigest()}
+    model = model_manifest(args.model_path)
+    training_code = training_code_fingerprint()
     subprocess.run([sys.executable, ".agents/skills/areno-run-training/scripts/inspect_dataset.py",
                     "--dataset-path", str(args.data_path), "--model-hub", "modelscope", "--algo", args.loss],
                    cwd=ROOT, check=True)
     eval_options = dict(attn_backend=args.attn_backend, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha)
-    before = {str(limit): evaluate(args.model_path, args.eval_path, args.output_dir / f"before-{limit}",
-                                  max_new_tokens=limit, **eval_options) for limit in args.eval_max_new_tokens}
-    results = []
+    before = {} if args.train_only else {
+        str(limit): evaluate(args.model_path, args.eval_path, args.output_dir / f"before-{limit}",
+                             max_new_tokens=limit, **eval_options) for limit in args.eval_max_new_tokens}
+    results, trained = [], []
     for case in cases:
         mode, lag = case["mode"], case["lag"]
         output = args.output_dir / case["label"]
@@ -304,31 +338,45 @@ def main(argv=None) -> int:
         assert all(math.isfinite(row["loss"]) for row in summary["native_train_stats"])
         assert any(row.get("metrics", {}).get("grad_norm", 0) > 0 for row in summary["native_train_stats"])
         metrics = measure(summary, output, monitor, warmup=args.warmup)
-        after = {str(limit): evaluate(args.model_path, args.eval_path, output / f"evaluation-{limit}",
-                                     output / f"checkpoint-{args.steps}", max_new_tokens=limit, **eval_options)
-                 for limit in args.eval_max_new_tokens}
-        primary = str(args.eval_max_new_tokens[0])
-        evaluation = {limit: {"before": {key: value for key, value in before[limit].items() if key != "samples"},
-                              "after": {key: value for key, value in value.items() if key != "samples"}}
-                      for limit, value in after.items()}
+        checkpoint = output / f"checkpoint-{args.steps}"
         result = {**case, "seed": args.seed, "ok": True, "source_sha": summary["source_sha"],
-                  "metrics": metrics, "quality_before": before[primary]["accuracy"],
-                  "quality_after": after[primary]["accuracy"], "evaluations": evaluation,
+                  "training_source_sha": summary["source_sha"], "training_code_sha256": training_code,
+                  "training_settings": training_settings(args, case), "environment": environment,
+                  "model_sha256": model["sha256"], "model_files": model["files"],
+                  "checkpoint": str(checkpoint.relative_to(args.output_dir)),
+                  "checkpoint_manifest": file_manifest(checkpoint),
+                  "metrics": metrics, "evaluations": {},
                   "train_max_new_tokens": args.max_new_tokens, "n_samples": args.n_samples,
                   "dataset_sha256": dataset_digests,
                   "policy": summary["policy"], "attn_backend": args.attn_backend,
-                  "held_out_questions": after[primary]["total"],
-                  "reload_equal_tensors": after[primary]["reload_equal_tensors"],
                   "reward_curve": [{"version": row["version_before"] + 1,
                                     "mean_reward": statistics.mean(row["rewards"]),
                                     "prompt_ids": row["prompt_ids"], "batch_version": row["batch_version"],
                                     "mean_response_tokens": statistics.mean(row["response_lengths"]),
                                     "token_limit_hits": row["token_limit_hits"]}
                                    for row in summary["updates"] if row["stepped"]]}
+        # Preserve paid training before any evaluation can fail or be preempted.
+        trained.append(result)
+        write(args.output_dir / "training-result.json", {"ok": True, "seed": args.seed, "cases": trained})
+        if not args.train_only:
+            after = {str(limit): evaluate(args.model_path, args.eval_path, output / f"evaluation-{limit}",
+                                         checkpoint, max_new_tokens=limit, **eval_options)
+                     for limit in args.eval_max_new_tokens}
+            primary = str(args.eval_max_new_tokens[0])
+            result = {**result, "quality_before": before[primary]["accuracy"],
+                      "quality_after": after[primary]["accuracy"],
+                      "held_out_questions": after[primary]["total"],
+                      "reload_equal_tensors": after[primary]["reload_equal_tensors"],
+                      "evaluations": {
+                          limit: {"before": {key: value for key, value in before[limit].items() if key != "samples"},
+                                  "after": {key: value for key, value in value.items() if key != "samples"}}
+                          for limit, value in after.items()}}
         write(output / "benchmark.json", result)
         results.append(result)
         print(json.dumps(result), flush=True)
     write(args.output_dir / "result.json", {"ok": True, "seed": args.seed, "cases": results})
+    complete_directory(args.output_dir, {"stage": "train" if args.train_only else "all",
+                                        "settings": [training_settings(args, case) for case in cases]})
     return 0
 
 

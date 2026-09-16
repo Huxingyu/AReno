@@ -58,14 +58,15 @@ def test_matrix_size_and_missing_evidence(tmp_path, suite, job_count, run_count)
     args = SimpleNamespace(suite=suite, seeds=None, model_path="checkpoint", output_dir=tmp_path,
                            steps=55, warmup=5, attn_backend="native")
     jobs = build_jobs(args)
-    assert len(jobs) == job_count
+    assert len(jobs) == run_count
     assert sum(len(job["cases"]) for job in jobs) == run_count
-    assert len({job["name"] for job in jobs}) == job_count
+    assert len({job["name"] for job in jobs}) == run_count
+    assert len({job["name"].removesuffix("-" + job["cases"][0]) for job in jobs}) == job_count
     if suite == "capacity":
         assert all(job["lag"] >= job["weight_sync_interval_updates"] for job in jobs)
     result = summarize(jobs, tmp_path)
     assert not result["complete"] and result["completed_jobs"] == 0
-    assert len(result["missing_jobs"]) == job_count
+    assert len(result["missing_jobs"]) == run_count
 
 
 def test_benchmark_rejects_missing_measured_window(tmp_path):
