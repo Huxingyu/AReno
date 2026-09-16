@@ -130,6 +130,12 @@ def test_failed_evaluation_retries_without_repeating_training(tmp_path, monkeypa
     matrix.execute(args, [job], manifest)
     matrix.execute(args, [job], manifest)
     assert calls == ["train", "evaluate", "evaluate"]
+    summary = matrix.summarize([job], tmp_path)
+    assert summary["complete"]
+    assert summary["failed_or_interrupted_attempts"] == [{
+        "job": job["name"], "attempt": f"{job['name']}/evaluate/attempt-0001/attempt.json",
+        "status": "failed",
+    }]
     result_file = tmp_path / job["name"] / "train/attempt-0001/artifacts/training-result.json"
     result_file.unlink()
     with pytest.raises(ValueError, match="missing or changed evidence"):
