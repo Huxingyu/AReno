@@ -108,8 +108,8 @@ def test_batching_matrix_holds_k_and_training_work_fixed_and_balances_order():
                 for job in selected} == {("sync", 1, 1), ("lag1", 1, 1), ("lag1", 2, 1), ("lag1", 1, 2), ("lag1", 2, 2)}
         assert all(job["max_inflight_rollouts"] == 2 and job["n_samples"] == 8
                    and job["steps"] == 55 and job["eval_max_new_tokens"] == [256] for job in selected)
-    assert jobs[0]["rollout_batch_groups"] == 1
-    assert jobs[3]["rollout_batch_groups"] == 2
+    first_by_seed = {job["seed"]: job["rollout_batch_groups"] for job in reversed(jobs)}
+    assert first_by_seed == {41: 1, 42: 2, 43: 1}
 
 
 def test_batch_comparison_refuses_a_different_k_or_lag_control():
