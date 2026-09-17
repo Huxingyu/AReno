@@ -1,6 +1,10 @@
-# 异步策略训练器：剩余工程 TODO（v4）
+# 异步策略训练器：剩余工程 TODO（v5）
 
-日期：2026-09-16。工程分支 `feat/async-policy-rewrite` @ `1871ea6`；可评审分支 `review/async-native` @ `d4fcc03`。两者的 `areno/`、`examples/`、`tests/` 内容一致。
+日期：2026-09-18。**实验代码分支 `feat/async-policy-batched` @ `bb8a063`**（包含 deterministic / campaign 两条子分支的全部改动）；可评审分支 `review/async-native` @ `b5d01f4`；本文档与实验产物在 `feat/async-policy-rewrite`。所有分支已推送 origin 并打 `archive/2026-09-18/*` tag。
+
+**2026-09-18 状态更新。** `campaign-20260917` 三条 lane 于 09-17 04:41 被 `modal app stop` 手动中断（不是代码失败，中断前完成的 job 全部 rc=0）。已有硬证据：r4 基准 3 seed 下 async lag1 相对 sync 更新速度 1.40×、token 吞吐 1.41×，lag0 为 0.72×；内核逐位确定性通过；严格全参数续训 seed41/42 通过（各自第一次因 Modal 超时失败，重试后过）；seed41 64 token 质量 sync/lag1 无明显差异。**尚无任何证据的：批处理收益、512 token 长输出吞吐、多 seed 质量对照、续训 seed43、最终版本 GPU 回归。** 下一批执行脚本见 [campaign-20260918](../../../runs/async-policy-rewrite/campaign-20260918/)，共 79 个 job，估算约 23 美元含重试。
+
+v4 原文（2026-09-16）：工程分支 `feat/async-policy-rewrite` @ `1871ea6`；可评审分支 `review/async-native` @ `d4fcc03`。
 
 本表替换 v3 的过时状态，只推进开源工程。历史记录保留在 Git 中。每项必须有代码或实验结果支持才能勾选；实验失败也是有效结果，但不能记成验收通过。
 
@@ -102,15 +106,22 @@
 
 **验收：** 24 个性能结果可配对比较；OOM/超时配置明确列出，调参后作为新配置重跑。识别哪些负载受益以及瓶颈位置，为 T08 提供依据。
 
-### T07 · P1：完成 Q/K/C 容量扫描（原 P4）
+### T07 · P1：同步间隔 C 扫描（原 Q/K/C 容量扫描，2026-09-18 缩减）
 
-**依赖：T01/T02，先用 T06 的 pilot 校准资源。**
+**依赖：T01/T02。执行脚本：`campaign-20260918/lane2.sh`。**
 
-- [ ] 按现有设计固定训练长度 64、4 samples、`lag=4`；扫描 `Q∈{1,2,4}`、`K∈{1,2}`、`C∈{1,2,4}`，每配置 seeds `41–43`，加 3 个同 seed 同步基线，共 **57 次训练**。
-- [ ] 先验证边界配置，再补全矩阵；记录真实同步间隔、队列峰值、K 许可峰值、stale drop、吞吐及显存。当前有效节拍受 `min(C, lag+1)` 约束，不能改回 lag=1 后宣称测到了 C=4。
-- [ ] 每个 checkpoint 用 128 题、256 token 上限复核质量，输出吞吐、陈旧数据与资源代价的对照；注明当前 K>1 仍只允许生成之外的 CPU 阶段并发。
+原设计 57 次训练里 Q 和 K 两维在当前负载下按构造不可测，已核实并砍掉：
 
-**验收：** 54 个异步结果和 3 个同步基线齐全，推荐配置有实际收益和质量依据；没有稳定优势时保留默认配置。
+- **K（在途组数）**：`contracts.py` 明确 "GPU sessions still serialize"，K>1 只让生成之外的 CPU 评分并行；本数据集评分是算术题字符串比对，毫秒级，K=1→2 收益约为零。
+- **Q（就绪队列容量）**：只有生成快于训练时队列才会堆积；r4 实测 async lag1 的 `queue_wait_s` 平均 0.0014 s，队列从未满过，瓶颈在权重同步（`sync_wait_s` 约 100 s）。扫 Q 等于调一个无压力的旋钮。
+- 两者只有在评分变重（模型打分 / 代码执行）或生成端算力多于训练端时才有意义，当前 0.6B + 算术题不满足。
+
+保留 C 一维：
+
+- [ ] 固定 64 token、4 samples、Q=2、K=1、`lag=4`；`C∈{1,2,4}` × seeds 41–43，加 3 个同 seed sync 对照，共 **12 次训练**。测的是 `weight_sync_interval_updates` 语义：同步在 `min(C, lag+1)` 次更新时触发是否成立，拉长同步间隔换来的吞吐与付出的策略陈旧度（stale drop、准确率）。
+- [ ] 每个 checkpoint 128 题、256 token 复核质量。
+
+**验收：** 9 个异步结果和 3 个同步基线齐全；给出推荐 C 或保留默认 C=1。
 
 ### T08 · P1：实现多个 prompt group 的生成批处理（原 P1）
 
@@ -148,7 +159,19 @@
 
 **下一步先做 T01/T02 的本地代码与 CPU 验证，再运行小规模 GPU 验收。** 全参数问题走 T03 独立分支，LoRA 主线可继续；随后分批完成 T04/T05/T06，利用测量结果推进 T07/T08。T09 的独立 PR 准备与 T10 可以穿插进行。
 
-当前 `matrix.py` 的默认计划已通过读取 `build_jobs()` 核对：
+2026-09-18 执行计划（`campaign-20260918/`，全部 `--seeds 41 42 43`，每 lane 独立预算账本）：
+
+| lane | 任务 | job 数 | 估算费用 | 测的能力 |
+|---|---|---:|---:|---|
+| lane0（先串行） | T03 续训 seed43；T09 `regression`/`faults`/`extended-faults` | 4 | ~1 美元 | 全参数 checkpoint 逐位可复现；SIGINT/SIGTERM 注入后引擎关闭、租约释放无残留 |
+| lane1 | T04 quality 64/256 × sync/lag1/lag0/offpolicy | 24 | ~6 美元 | 三种准入策略相对 sync 的准确率；stale drop 是否伤质量；256 token 回答 seed43 截断问题 |
+| lane2 | T05 gspo；T07 C 扫描 | 12 + 12 | ~6 美元 | 损失插件在异步路径下正确；同步间隔语义与代价 |
+| lane3 | T08 batching；T06 throughput 仅 `*tokens512*` | 15 + 12 | ~10 美元 | `rollout_batch_groups=2` 的吞吐收益与 C≥G 约束；长输出下异步重叠收益是否放大 |
+| 合计 | | **79** | **~23 美元含重试** | 3 lane 并行约 5 小时 |
+
+明确不跑：capacity 的 Q/K 两维 45 次；quality seeds 44/45 待 3 seed 趋势后再定。单 job 实测：64 token 训练 217–308 s、512 token 约 390 s（2×L4），评测 14–383 s（1×L4），含冷启动均值约 9 分钟、0.25 美元。
+
+v4 原始计划（2026-09-16）：
 
 | 套件 | 当前分组任务数 | 训练次数 | 本 TODO 采用的评测 |
 |---|---:|---:|---|
