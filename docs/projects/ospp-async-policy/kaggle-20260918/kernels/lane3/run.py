@@ -77,6 +77,20 @@ def install_runtime_deps():
         "huggingface-hub>=0.25", "openai", "tqdm>=4.66", "av>=12", "librosa>=0.11", "soundfile>=0.13")
 
 
+def link_extension(*repos):
+    """Tools run with the source tree first on sys.path, so the compiled .so
+    from the installed wheel must also live inside each checkout."""
+    import importlib, glob
+    pkg = Path(importlib.import_module("areno.accel").__file__).parent
+    sos = list(pkg.glob("_areno_accel*.so"))
+    assert len(sos) == 1, sos
+    for repo in repos:
+        dest = Path(repo) / "areno" / "accel" / sos[0].name
+        if not dest.exists():
+            shutil.copy2(sos[0], dest)
+        log(f"extension -> {dest}")
+
+
 def torch_tag():
     import torch
     return f"torch{torch.__version__}-py{sys.version_info.major}{sys.version_info.minor}"
@@ -117,6 +131,7 @@ def role_build():
     (wheels / "TORCH_TAG").write_text(torch_tag())
     log(f"built {wheel.name} for {torch_tag()}")
     pip("--no-deps", str(wheel))
+    link_extension(repo)
     from huggingface_hub import snapshot_download
     raw = Path(snapshot_download(MODEL_ID, cache_dir=str(WORK / "hf-cache")))
     model = fp16_model(raw, WORK / "model-fp16")
@@ -126,6 +141,7 @@ def role_build():
     # depend on GitHub being reachable.
     for sha, name in ((BATCHED_SHA, "src-batched.tar"), (DETERMINISTIC_SHA, "src-deterministic.tar")):
         d = checkout(sha, SRC.parent / name.replace(".tar", ""))
+        link_extension(d)
         with tarfile.open(WORK / name, "w") as tar:
             tar.add(d, arcname=name.replace(".tar", ""))
     # Smoke job: one quality config, sync + lag1, validates fp16 training on T4
@@ -151,6 +167,7 @@ def restore_build():
         with tarfile.open(BUILD_INPUT / f"{name}.tar") as tar:
             tar.extractall(SRC.parent)
     model = fp16_model(BUILD_INPUT / "model-fp16", WORK / "model-fp16")
+    link_extension(SRC.parent / "src-batched", SRC.parent / "src-deterministic")
     return SRC.parent / "src-batched", SRC.parent / "src-deterministic", model
 
 
