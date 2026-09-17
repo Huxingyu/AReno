@@ -1,213 +1,177 @@
-# 异步策略训练器：下一阶段 TODO（v3）
+# 异步策略训练器：剩余工程 TODO（v4）
 
-日期：2026-09-15。基线：`feat/async-policy-rewrite` @ `a35a580`，上游起点 `48d07c5`。
-本表接续 [REWRITE_TODO.md](./REWRITE_TODO.md)（R0–R4 已勾选）和资料分支 `docs/ospp-async-policy` 中的 `TODO.md`（v2，OSPP 流程与 T00–T16）。
-状态纪律不变：区分"计划 / 代码存在 / 已验证"，只有证据到位才勾选。
+日期：2026-09-16。工程分支 `feat/async-policy-rewrite` @ `1871ea6`；可评审分支 `review/async-native` @ `d4fcc03`。两者的 `areno/`、`examples/`、`tests/` 内容一致。
 
-> 2026-09-16 已完成逐项源码审查、本地实现、四个 PR 分支及其验证。详见 [审查报告](NEXT_REVIEW.md)、[扩展设计](EXTENSION_DESIGN.md)、[执行证据](evidence/next-stage-validation.md) 和 [PR 分支说明](PR_SERIES.md)。下文第 0 节保留 a35a580 的历史状态；新代码的 CPU 证据与[待执行 GPU 验收](GPU_VALIDATION_PLAN.md)分别记录，不继承旧提交的 GPU 通过状态。
+本表替换 v3 的过时状态，只推进开源工程。历史记录保留在 Git 中。每项必须有代码或实验结果支持才能勾选；实验失败也是有效结果，但不能记成验收通过。
 
-## 0. 完成度判定
+本轮进展：实验执行器在 `feat/async-policy-campaign` @ `b5d01f4`；确定性内核与续训审计在独立 `feat/async-policy-deterministic` 分支。记录目录为 [overnight-20260916](../../../runs/async-policy-rewrite/overnight-20260916/)。
 
-**结论：首版工程交付完成，项目未完成。** 差在三处：质量稳定性未证明、代码尚不具备上游可合入形态、OSPP 流程一项未动。
+- T01/T02：真实评测超时后仅补评测，训练只运行一次；重入没有新增 attempt 或费用。64/256 评测复用 3/4 项缓存，checkpoint hash 不变，失败历史保留。旧 flash pilot 经审核不混入新的 native 矩阵。
+- T03：72 项内核检查通过，含 1,080 次逐位比较和 56 项 CUDA Graph 检查；首组完整续训在第 2 步后的整份优化器审计超时，严格 E2 仍未通过。逐 bucket 审计修复已通过 25 项 CPU 检查，等待 GPU 重试。
+- T09：主线完整 CPU 为 950 passed、12 failed、10 skipped；12 个失败与 `a35a580` 相同，原测试节点全部保留。四个草稿 PR 已发布：[#563](https://github.com/inclusionAI/AReno/pull/563)、[#564](https://github.com/inclusionAI/AReno/pull/564)、[#565](https://github.com/inclusionAI/AReno/pull/565)、[#566](https://github.com/inclusionAI/AReno/pull/566)。目前没有 CI check 或评审结果，不代表已通过 CI 或合并。
+- T10：远端原始 checkpoint 已清点并生成 SHA-256：43 个文件、10,539,110,709 字节。外接盘备份正在下载，尚未完成最终哈希验收。
 
-| 官方交付 | 状态 | 依据 | 缺口 |
-|---|---|---|---|
-| D1 experimental async trainer | 已验证 | `AsyncPolicyPipeline`，CPU 92 项、双 L4 五组 GPU 用例 | 可选集成尚缺 `register_algorithm` / 公开 `Trainer`；官方允许先提供 experimental class，非 D1 的必选缺口 |
-| D2 生命周期管理 | 已验证 | Supervisor / 统一 close；SIGINT、SIGTERM、worker 强退、NCCL 阻塞均回收 | 无 |
-| D3 AReno-native 权重同步 | 已验证 | 复用 `policy_sync` NCCL，392 张量逐项相等 | 每次同步等待在途 rollout 结束（约 2 s / update） |
-| D4 文档与 smoke recipe | 部分 | `examples/async_policy/train.py`，中文项目文档 | `docs/` 下无面向用户的英文页面；示例硬编码 flash attn 与 base model 名 |
-| D5 Q / K / C 配置 | 已验证 | `AsyncPolicyConfig` 四项 + staleness | K>1 只并发 CPU 阶段，GPU 生成仍串行 |
+## 1. 当前究竟还缺什么
 
-| 官方约束 | 状态 | 备注 |
+**工程首版已落地。剩余工作集中在实验执行器、完整对照实验、生成批处理、全参数续训一致性和 PR 收尾。**
+
+| 原 TODO | 已完成的事实 | 真正剩余的工作 |
 |---|---|---|
-| R1 experimental 包 | 满足 | |
-| R2 GRPO 优先 | 满足 | |
-| R3 复用 `grpo_loss_fn` | 满足 | 但该 loss 的 ratio 恒为 1，异步下无行为策略修正，见 Q2 |
-| R4 GSPO 可扩展 | 未验证 | `native.train` 硬编码 `grpo_loss_fn` |
-| R5 有界队列 + staleness | 满足 | |
-| R6 资源分离重叠 | 满足 | trace 证明跨卡内核重叠 |
-| R7 同步路径不变 | 满足 | 干净上游 GRPO / GSPO 回归逐项一致；核心改动仅 82 行新增 |
-| R8 无外部推理依赖 | 满足 | |
-| R9 单机可调试 | 满足 | |
+| U1/U4/U5/U6、LoRA 续训 | 公开生命周期接口、英文用户文档、工具迁移、参数化示例已实现；示例、故障回收、LoRA 续训 GPU 验证通过 | 最终提交回归，见 T09；无需重复实现 |
+| Q1：seed 43 退化 | 固定旧 checkpoint 重评后，原来答对→答错的 8 题全部在 256 token 上限下恢复；原 32 题 lag=1 从 16/32 到 28/32 | ≥5 个种子的训练长度、评测长度及调度对照，见 T04 |
+| Q2：off-policy loss | 可选 loss 已实现；seed 43 同条件下默认 GRPO 为 108/128，可选 loss 为 104/128 | 多种子消融，不能据此替换默认 loss，见 T04 |
+| E1：GSPO | 原生异步已跑通；seed 43 同步 25/32、异步 26/32，测量窗口内约 1.38× | 128 题、多个种子和训练长度的复验，见 T05 |
+| E2：全参数续训 | 恢复边界的模型、FP32 优化器、CPU/CUDA RNG、global step 全部精确一致 | 续训后的逐位比较仍失败；独立连续训练也有差异，见 T03 |
+| P1/P3/P4 | 实验矩阵入口和扩展设计存在 | 生成批处理未实现；长输出与容量矩阵未完成，见 T06–T08 |
+| U2：PR | 四个 review 分支已形成；`review/async-native` 已推送 | 最新提交验证、PR 发布和后续评审尚未完成，见 T09 |
+| H2/H3：结果保存 | 新一轮 384 个文件、约 3.03 GB 已备份并校验；项目 GPU 任务上轮结束时已停止 | 全参数原始状态仍主要保留在 Modal Volume，见 T10 |
 
-## 1. P0：质量与语义（Q）
+证据入口：[GPU 原始结果](../../../runs/async-policy-rewrite/next-gpu/)、[CPU 与分支验证](../../../runs/async-policy-rewrite/next-stage/)。以上 GPU 结果属于各自 `request.json` 中的提交，不能统一写成当前 HEAD 已通过。
 
-- [ ] **Q1 种子 43 退化归因。** 三种子、32 题、64 token 上限下 lag=1 从 21 降到 16，同步 23；26/32 回答被截断。
-  - 步骤：种子扩到 ≥5；训练长度设 64/256，固定 checkpoint 分别按 64/256 评测；评测集扩到 ≥128 题并保留原 32 题子集；记录 token 上限命中率、平均回答长度、reward 曲线和参与更新的 prompt IDs。同步 / lag=1 / lag=0 同矩阵。
-  - 完成条件：分开报告固定 checkpoint 的评测长度效应、固定评测预算的训练长度效应及同预算的调度差异。复现或未复现均如实记录；更大样本未复现不等于证明长期无退化。
-  - 证据：`runs/async-policy-rewrite/quality-v2/`，`benchmark_run.py` 参数化。
-- [ ] **Q2 行为策略比值消融。** 现有 loss 用 `exp(logp - logp.detach())`，比值恒 1、clip 无效；`layout.old_logprobs` 已在 pack 里但只用于指标。
-  - 步骤：在 `areno/experimental/async_policy/` 内新增可选 `grpo_offpolicy_loss_fn`，分母改用 `old_logprobs`，保留 clip；不改上游 `grpo_loss_fn`（R3 / R7）。`native.train` 接受 `loss_fn` 参数。用 S1 用例验证数值差异符合预期。
-  - 完成条件：Q1 矩阵上多一列"lag=1 + off-policy ratio"，给出质量对照。
-  - 评审点：这是算法决定，先发导师；官方要求复用现有 loss，消融结果只作为建议。
-- [x] **Q3 staleness 语义文档化。** lag 是训练准入阈值并可提前触发同步，不选择 loss。lag=0 不等价于串行同步，可能生成并丢弃旧版本数据；不能声称每批必然过期。
-  - 完成条件：DESIGN 增加一节；`AsyncPolicyConfig` docstring 说明各字段单位。
+最后一次完整 CPU 结果属于 `2b0575a`：921 passed、12 failed、10 skipped；12 个失败与比较基线 `a35a580` 相同。后续工具修改只跑了相关测试。最新的持久化补丁 `1871ea6` / `d4fcc03` 还没有经过新的 GPU 中断验收。
 
-## 2. P0：上游可合入性（U）
+## 2. 可执行 TODO
 
-本节方案经 2026-09-16 源码核对后更新；历史位置仍以 `a35a580` 为准。实现和验收分开标注。
+### T01 · P0：让实验可以中断、续跑，并限制整批运行时间
 
-### U1 去除 `native.py` 对 engine 私有成员的耦合
+**依赖：无。代码位置：** [matrix.py](../../../examples/async_policy/tools/matrix.py)、[modal_run.py](../../../examples/async_policy/tools/modal_run.py)、[benchmark_run.py](../../../examples/async_policy/tools/benchmark_run.py)。
 
-2026-09-16：公开接口与 native 迁移已实现并通过相关 CPU 测试；GPU faults / extended-faults 待重跑。下表是基线问题，不是新实现仍有的访问。
+问题：当前矩阵按多个 case 组成一个任务，本地串行执行；不能直接调度 Modal，也不能跳过已完成 case。`retries=0` 没有阻止已观察到的抢占重试；单次 timeout 不能代表整批费用上限。
 
-**现状。** `native.py` 触碰了 `TPCluster` / `ClusterCallHandle` 的 7 处私有成员，并子类化重写了 2 个私有方法。上游 `protocol.py` 任何重构都会静默破坏 GPU 路径，CPU 测试发现不了。
+- [x] 将执行单位拆到单个训练 case；保留配对种子、执行顺序和稳定任务 ID。执行前输出任务数、资源、时间上限与待运行列表。
+- [x] 逐 case 持久化状态、checkpoint 引用和结果。恢复时校验完成标记及文件 hash，再跳过成功项；失败/中断的重试使用独立 attempt 记录，保留原日志与已用时间。
+- [x] 将开始标记和关键进度及时提交到 Volume；补整批 deadline、累计 GPU 占用和重试次数控制。超限后停止本批所属任务并保存缺项清单；计时覆盖启动、重试和收集阶段。
+- [x] CPU 用例覆盖：中途退出、重复启动、结果缺文件、配置变更、预算耗尽。再用少量更新做一次真实 Modal 中断/重入验收，核实最新的独占创建日志保护确实避免重复训练。
 
-| `native.py` 位置 | 访问的私有成员 | 上游位置 | 为什么要绕过 |
-|---|---|---|---|
-| `_wait_handles` | `handle._pending.event` | `protocol.py:219` `ClusterCallHandle` | `result(timeout)` 超时会 pop 掉 pending 并抛错，等于取消，不能用来轮询；需要"只等不取消" |
-| `_make_cluster` 子类 | 重写 `_wait_for_worker_ready` | `protocol.py:412` | 上游固定 0.2 s 轮询、无截止时间、无 stop event |
-| `_make_cluster` 子类 | 重写 `_abort_start` | `protocol.py:389` | 上游 `_abort_start` 清空 `processes`，pair 无法事后核对 exitcode |
-| `close` | `_pump_stop`、`_pump_thread`、`_pending_lock`、`_pending_calls`、`_finish_pending_call`、`_rendezvous_store` | `protocol.py:567` `close()` | 上游 `close()` 固定 5 s grace + terminate，无 kill、无超时参数、不返回退出信息、不唤醒等待中的调用 |
-| `initialize` | 手工拼 `EngineConfig` 18 行 | `api.py:208` `ArenoEngine.from_pretrained` | 没有绕过的必要，是重复实现 |
+**验收：** 两次执行同一小矩阵，成功 case 只训练一次；未完成项可恢复或显式重试；原始证据不被覆盖；达到 deadline 后没有本批遗留 GPU 任务。
 
-**方案：给上游 `protocol.py` 加公开接口，用带默认值的新参数保留现有调用形式；关闭与失败语义的修正明确列出。**
+### T02 · P0：分离训练与评测，补齐结果复用和统计
 
-1. `ClusterCallHandle.done() -> bool` 与 `ClusterCallHandle.wait(timeout: float | None) -> bool`：只等待 `_pending.event`，不 pop、不抛。`result()` 保持不变。约 8 行。
-2. `TPCluster.close(*, timeout_s: float | None = None) -> list[WorkerExit]`：`timeout_s=None` 保留旧 grace / terminate 路径；关闭唤醒和关闭后拒绝提交是明确修正，不声称所有失败行为完全一致。给定时按三段分配预算（SHUTDOWN grace、terminate、kill），返回每个进程的 `(rank, pid, exitcode, alive)`；关闭前用 `_finish_pending_call` 以 `RuntimeError("cluster closed")` 唤醒所有 pending call；仍有 `alive` 时抛 `TimeoutError`。`WorkerExit` 是新 dataclass。实现还需处理提交/关闭竞态、结果重复完成及 pipe feeder，不能按约 30 行估算。另增 `request_shutdown()`，让两分区先发退出通知再等待。
-3. `start_partitioned_clusters(..., *, timeout_s: float | None = None, stop_event: threading.Event | None = None)`：透传到 `_wait_for_worker_ready(pending, deadline, stop_event)`；超时或 stop 时先 `_abort_start()` 再抛。`_abort_start` 返回退出信息，失败时保留可观察状态。启动等待共享截止时间；失败清理另有两分区共享的 5 秒预算，必须明确写入接口语义。
-4. `native.initialize` 改用 `ArenoEngine.from_pretrained(..., start=False, cluster_kwargs={"world_spec":..., "partition":...})` 构造两个引擎，与 `backend.py:225-259` 同一写法；再调 `start_partitioned_clusters(train.cluster, rollout.cluster, world, timeout_s=..., stop_event=...)`。RPC 仍用 `cluster.submit` 而不是 `ArenoEngine.generate_rollout` / `step`，因为那两个是无超时的 `cluster.call`。
-5. `native.close` 先对两个分区调用 `request_shutdown()`，再按剩余预算分配 `cluster.close(timeout_s=...)`；即使一侧失败也尝试另一侧，收集公开退出信息到 `worker_exits`。
+**依赖：T01 的任务标识与持久化。代码位置：** 上述工具、[reevaluate_run.py](../../../examples/async_policy/tools/reevaluate_run.py)、[测试](../../../tests/test_async_policy_benchmark_cpu.py)。
 
-- 完成条件：`grep -n "\._pending\|_pump\|_rendezvous\|_wait_for_worker_ready\|_abort_start" areno/experimental/async_policy/native.py` 为空；`tests/test_async_policy_native_cpu.py` 当前 13 项通过；Modal `faults` 与 `extended-faults` 阶段重跑通过。前两项已验证，GPU 两阶段待跑。
-- 上游测试：`test_protocol_cpu.py`、`test_parallel_partition_cpu.py` 已覆盖退出信息、非取消等待、启动超时/停止、关闭竞态与失败重试；独立 PR 2 加 checkpoint/backend/import 检查共 33 项通过。
-- 顺带：`training_state.py` 读写 `worker._global_step`，同在 engine 层可接受，但建议给 `ArenoWorker` 加 `global_step` 只读属性。
-- 评审点：接口草案先发导师；这是 PR 4 的前置，也可独立成小 PR。
+问题：当前每个任务重复评测 base model，训练和多次评测共用 GPU 时限；汇总只读取整个任务的最终 `result.json`。已有部分证据不能被直接算作完整矩阵。
 
-### U7 与 `CudaBackend` 的关系
+- [x] 训练完成后立即保存 checkpoint 与训练指标，独立安排固定 checkpoint 评测；评测失败不触发重新训练。GPU 任务返回结果位置和摘要，较大的下载/压缩放到本地或 CPU 阶段。
+- [x] base 评测按模型/权重、tokenizer、数据集、生成参数、评测实现及运行环境指纹缓存。汇总同时校验学习率、LoRA 设置、loss、训练步数、预热、评测长度和题目数，拒绝重复或不兼容结果。
+- [x] 分别记录训练提交和评测提交。对已有 off-policy/GSPO pilot，核对训练代码与完整设置后，允许只补缺失评测；旧 `9619e1e2` checkpoint 的截断分析继续作为历史证据。不能只改 SHA 字段把旧结果拼进新矩阵。
+- [x] 从每个已完成 case 汇总，明确列出缺项、失败项和缺失同步对照；仅全部满足预定矩阵时标记 complete。输出逐 seed 配对差值、均值/中位数、范围及 seed 级区间，保留原始数值；3–5 个种子的区间只作探索性分析。
 
-**现状。** 流水线绕过 `areno/api/backend/cuda/backend.py`，直接驱动 worker。绕过的不是偶然，是 backend 三处状态与并发训练冲突：
+**验收：** CPU 用例拒绝混入不同训练参数、缺失评测长度和重复种子；固定 checkpoint 的 64/256 评测不修改权重、不重新训练；缓存命中与补跑均可追溯。
 
-| `CudaBackend` 状态 | 位置 | 冲突 | 异步下的替代 |
-|---|---|---|---|
-| `train()` 在 `_separate_rollout and _rollout_session_active` 时抛错 | `backend.py:503` | 异步的定义就是 rollout session 活跃时训练 | `coordinator.begin_train`：SYNC 模式保留该互斥，ASYNC 模式允许，因为两侧在不同设备、权重复制只在 sync 独占区 |
-| `_train_policy_version` 在 stepped 后自增 | `backend.py:531-535` | 与 coordinator 的 Vt 重复计数 | `coordinator.end_train(stepped)` |
-| `_rollout_policy_version` 在 `_sync_policy_if_needed` 设置；同步在下一次 rollout 前 lazy 触发；`.result()` 无超时 | `backend.py:282-323` | 无安全点概念，无法"先关准入再等在途操作"，无 cadence / lag 控制 | `coordinator.begin_sync / end_sync`，C 与 lag 显式触发，`_wait_handles` 带截止时间与 stop event |
+### T03 · P0：处理全参数续训严格一致性失败（原 E2）
 
-`initialize` 部分（`backend.py:135-261`）没有冲突，`native.py` 只是重复了它，U1 第 4 步解决。
+**依赖：T01；不阻塞 LoRA 的质量实验。代码位置：** [resume_run.py](../../../examples/async_policy/tools/resume_run.py)、[gpu_worker.py](../../../examples/async_policy/tools/gpu_worker.py)、[training_state.py](../../../areno/engine/checkpoints/training_state.py)。
 
-**三条路线，建议 PR 3 / 4 走 A，B / C 写进设计 issue 征求意见。**
+现有[结果](../../../runs/async-policy-rewrite/next-gpu/resume-full-02/artifacts/result.json)：311 个张量中，连续/续训有 22 个不同，最大绝对误差 `3.814697e-6`；两个相同初态的连续运行有 24 个不同，最大误差 `1.907349e-6`。最终优化器也不同，恢复边界则全部精确一致。原子归约重复性探针提供了线索，尚不足以把所有误差都归因到两个算子。
 
-- **A（现状加说明）**：不动 `CudaBackend`。PR 描述里放上表，说明 bridge + coordinator 承担并发路径的准入、版本与同步职责，SYNC 模式保持模型操作互斥；不据此声称调度轨迹完全相同。旧提交的干净上游 GRPO / GSPO 回归不能代替本轮候选重跑。代价：SDK `Trainer` 无法直接驱动异步，见 U3 的依赖。
-- **B（backend 加实验开关）**：`CudaConfig` 新增 `concurrent_rollout: bool = False`（属于 AGENTS "Ask first"）。开启时 `train()` 跳过 503 行守卫；`_sync_policy_if_needed` 改为 no-op，新增公开 `sync_policy(version, timeout_s)` 供 bridge 调用；两个版本号由调用方提供。这让 `Trainer` SDK 能接异步，但改了公开 backend 行为。
-- **C（长期）**：把 coordinator 下沉到 backend，同步模式也走 `mode=SYNC` 的 coordinator，503 行守卫由它实现。这是 U3 注册 `async-grpo` 的干净前提，工作量最大。
+- [ ] 保留原 `ok:false` 和严格判据；将“精确恢复”和“后续逐位一致”分别汇总。已有 FP32 优化器状态恢复正确，不再沿“恢复时被转成 BF16”的已排除假设修改代码。
+- [ ] 至少做 3 组独立的“连续 / 中断续训 / 独立连续对照”，固定输入、初始化与种子；记录各步模型、优化器、RNG、步数，以及差异分布。流式比较，避免再为每一路保存多份巨大的优化器文件。
+- [ ] 任一恢复边界不一致时先修保存/加载；若恢复精确而后续对照仍不确定，保留原生非确定性限制，并检查续训差异是否超出对照观察范围，不能事后选 tolerance 把失败改绿。
+- [ ] **严格一致性修复独立提交：** 从已定位的 embedding / RMSNorm 原子累加开始验证确定性归约路径；先通过同输入梯度重复性检查，再跑上述端到端对照。涉及 `areno/accel` 时更新构建并重建扩展，不能沿用当前 Modal 的旧扩展缓存。
 
-- 完成条件：PR 3 描述含上表；设计 issue 得到维护者对 B / C 的态度并记入 `evidence/decisions.md`。
+**验收：** 严格 E2 只有在恢复边界、续训最终模型及优化器逐位一致的重复对照全部通过后才勾选。若本阶段交付保留原生非确定性，E2 继续标为未完成；可以发布明确该限制的 experimental/LoRA 能力。
 
-### U3 实验入口形式
+### T04 · P0：完成 GRPO 质量与 off-policy 消融（原 Q1/Q2）
 
-2026-09-16 核实：暂保留 package/pipeline 入口；`Trainer.init()` 确实启动 backend，init 前 tokenizer 为 None。算法 loop 由 CLI factory 创建并调用 `fit()`，不能混同公开 SDK Trainer 的职责。
+**依赖：T01/T02；冻结训练代码与数据。**
 
-**事实。** `AlgorithmSpec(name, trainer_cls | factory, default_loss_fn, requires_rollout, loss_fn_factory)`（`algorithms.py:38-49`）。`build_trainer` 只做一件事：`trainer_cls(config, instance=, dataset=, reward_fn=, loss_fn=)`（`trainer_factory.py:16`）。`load_experimental_algorithms` 自动导入 `experimental/` 下每个包（`algorithms.py:181`），所以在 `async_policy/__init__.py` 里调 `register_algorithm` 即可注册，且该包导入已不加载 torch，满足"轻量"要求。
+- [ ] 固定 seeds `41–45`，训练长度 `64/256`，`n_samples=4`；比较 `sync / lag=1 / lag=0 / lag=1 + off-policy`，共 **40 次训练**。每次 55 updates，性能统计排除前 5 次预热。
+- [ ] 每个最终 checkpoint 都在相同 128 题上按 `64/256` 两种上限评测，保留原 32 题子集。记录正确率、截断率、回答长度、reward 曲线、参与更新的 prompt IDs、实际 token 数及丢弃率。
+- [ ] 分别比较：固定 checkpoint 的评测长度效应、固定评测长度的训练长度效应，以及相同训练设置下的调度/loss 差异。核对可复用 pilot 后只补缺项。
+- [ ] 出现非有限 loss、恢复/同步错误时先修复再继续；质量下降保留并分析，不能删除失败种子、反复换 seed 或提前宣称收敛。
 
-**要注册 `async-grpo` 需要补的东西。**
+**验收：** 40 个兼容训练结果及完整配套评测可汇总，结论覆盖所有种子。`lag=0` 是准入策略，不要求与串行轨迹相同；默认 GRPO 的 ratio 数值为 1 仍有梯度。off-policy 是否更优由结果决定。55 步实验不证明长期稳定；加长训练须另有具体待验证假设。
 
-1. `AsyncGRPOTrainer(config, *, instance, dataset, reward_fn, loss_fn)` 类，接口对齐 `PolicyOnlyTrainer`，提供算法 loop 的 `fit()`。它由 CLI factory 创建；公开 SDK `Trainer` 是传入 loop 的执行实例，两者职责不同。
-2. reward 已兼容：当前 `areno/api/rewards.py` 与 `PolicyOnlyTrainer` 都使用 `reward_fn(RewardRecord) -> float`，无需为旧接口描述新增适配层。
-3. 数据适配：dataset 记录 → `AsyncPrompt`，tokenize 用 `instance` 的 tokenizer；`examples/async_policy/train.py:load_prompts` 已有雏形。
-4. Q / K / C / lag 配置通道：当前 `TrainerConfig` 没有 `async_policy` 字段。若选择新增 `async_policy: AsyncPolicyConfig | None = None`，属于 "Ask first"；先决定入口与配置所有权，本轮不修改公开 dataclass。
-5. **依赖 U7**：`Trainer.init()` 确实初始化 backend，init 前 `get_tokenizer()` 为 None。直接叠加 A 路线会双重启动 worker；必须先确定 SDK 生命周期，或独立加载 tokenizer，不能只注册一个名义入口。
+### T05 · P1：完成 GSPO 多种子验证（原 E1）
 
-- 完成条件：与导师确认三种形式选哪种；若选注册，上述 5 点各有测试；`areno train --algo async-grpo` 能跑 `examples/async_policy` 的数据。
-- 评审点：官方原文是"例如"，包形式已满足 R1；注册是加分项不是必需项，不要为它改公开 config 而不问。
+**依赖：T01/T02。**
 
-### U4 面向用户的英文文档
+- [ ] seeds `41–43` × 训练长度 `64/256` × `sync/lag=1`，共 **12 次训练**；统一 55 updates、5 warmup、4 samples。
+- [ ] 每个 checkpoint 补齐 128 题、评测上限 `64/256`，检查 loss/梯度、版本、同步互斥、checkpoint 重载与 worker 退出。
+- [ ] 输出逐 seed 质量差值与吞吐比。现有 seed 43 的 32 题 pilot 先按 T02 审核复用，不能直接当成 128 题矩阵已完成。
 
-2026-09-16：两页与 toctree 已完成；基线/候选 HTML 构建均无警告。
+**验收：** 原生 GSPO 在全部设定中可训练、同步、保存与评测；如加速或质量不稳定，限制结论的适用范围，不把单次 1.38× 当作普遍结果。
 
-`docs/` 是 Sphinx（`index.rst` 五个 toctree）。新增两页，英文：
+### T06 · P1：长输出与大采样性能矩阵（原 P3）
 
-- `docs/concepts/async-policy.rst`，挂 Conceptual Guides，紧接 `backend-topology`。内容：动机（对应官方背景四场景）、两级流水线图、Q / K / C / lag 四个字段的单位与默认值、staleness 语义（Q3 的结论）、支持拓扑（每角色单 GPU、TP=1 / DP=1）、退出语义表（EOF / max_steps / stop / abort / failed）、reward 取消边界、已知限制（K>1 不增加 GPU 生成并发、同步等待在途 rollout、质量未证明）。
-- `docs/cookbook/async-grpo-two-gpu.rst`，挂 Cookbook。内容：环境、`examples/async_policy/train.py` 全部参数、预期输出文件（`result.json` / `updates.jsonl` / `samples.jsonl`）、同步对照命令、续训命令、如何读 `benchmark-summary.json`。
-- 完成条件：`make -C docs html` 无新增警告；两页从 `index.rst` 可达；不出现 `runs/`、Modal、个人路径。
+**依赖：T01/T02。代码位置：** `matrix.py`、`benchmark_run.py`。
 
-### U5 验证工具归位
+- [ ] seeds `41–43` × 训练长度 `256/512` × `n_samples=4/8` × `sync/lag=1`，共 **24 次训练**。先运行一个高负载 pilot，校准显存、任务时限与测量窗口，再展开。
+- [ ] 固定种子配对并平衡执行顺序；记录预热后的 updates/s、参与训练及实际生成的 token/s、端到端训练时间、两卡显存峰值、队列/同步等待和 stale drop。评测时间单独统计。
+- [ ] 每个 checkpoint 在 128 题、256 token 上限下做质量复核；若仍有明显截断，追加固定 checkpoint 的更长评测并单独报告。性能归因检查实际 prefill/decode 和同步时间，不将重叠等待简单相加。
 
-2026-09-16：六个工具已迁到 `examples/async_policy/tools/`，smoke 资产已迁到示例目录；当前仓库没有顶层 tools。工具帮助与预览入口已验证。
+**验收：** 24 个性能结果可配对比较；OOM/超时配置明确列出，调参后作为新配置重跑。识别哪些负载受益以及瓶颈位置，为 T08 提供依据。
 
-`tests/async_policy_validation/` 2,484 行。按用途拆：
+### T07 · P1：完成 Q/K/C 容量扫描（原 P4）
 
-| 文件 | 去向 |
-|---|---|
-| `known_cases.py`、`protocol_cases.py`、`torch_cases.py`、`tiny_backend.py`、`fakes.py`、`reference.py`、`run.py`、`sdk_regression.py`、`sdk_train_fixture.json` | 留在 `tests/async_policy_validation/`，是 pytest 收集或显式运行的测试 |
-| `modal_run.py`、`gpu_run.py`、`gpu_worker.py`、`benchmark_run.py`、`example_run.py`、`resume_run.py` | 已移到 `examples/async_policy/tools/`；仓库没有现成的顶层 tools 目录 |
-| `smoke_prompts.jsonl`、`smoke_reward.py` | 并入 `examples/async_policy/` |
+**依赖：T01/T02，先用 T06 的 pilot 校准资源。**
 
-- 完成条件：`pytest tests/ -k cpu` 不丢失任何原有测试 node ID（已验证 911 项全部保留、新增 32 项）；`modal_run.py` 的 `--phase` 全部仍可运行（17 种资源预览已过，GPU 实跑待验收）；REWRITE_TODO 的复现命令已更新。
+- [ ] 按现有设计固定训练长度 64、4 samples、`lag=4`；扫描 `Q∈{1,2,4}`、`K∈{1,2}`、`C∈{1,2,4}`，每配置 seeds `41–43`，加 3 个同 seed 同步基线，共 **57 次训练**。
+- [ ] 先验证边界配置，再补全矩阵；记录真实同步间隔、队列峰值、K 许可峰值、stale drop、吞吐及显存。当前有效节拍受 `min(C, lag+1)` 约束，不能改回 lag=1 后宣称测到了 C=4。
+- [ ] 每个 checkpoint 用 128 题、256 token 上限复核质量，输出吞吐、陈旧数据与资源代价的对照；注明当前 K>1 仍只允许生成之外的 CPU 阶段并发。
 
-### U6 示例脚本修正
+**验收：** 54 个异步结果和 3 个同步基线齐全，推荐配置有实际收益和质量依据；没有稳定优势时保留默认配置。
 
-2026-09-16：参数与元数据修正及 CPU 测试已完成；GPU example 阶段待重跑。
+### T08 · P1：实现多个 prompt group 的生成批处理（原 P1）
 
-`examples/async_policy/train.py:118-121`：
+**依赖：T06 的瓶颈证据；独立分支，保留既有矩阵对应的版本。代码位置：** [pipeline.py](../../../areno/experimental/async_policy/pipeline.py)、[bridge.py](../../../areno/experimental/async_policy/bridge.py)、[native.py](../../../areno/experimental/async_policy/native.py)、[data.py](../../../areno/experimental/async_policy/data.py)。
 
-- `base_model_name_or_path="Qwen/Qwen3-0.6B"` → 用 `args.model` 原值（解析前的仓库引用）。
-- `runtime={"attn_backend": "flash"}` → 新增 `--attn-backend {flash,native}`，默认 `native`，flash 需要 flash-attn 已装。
-- `LoraConfig(rank=8, alpha=16)`、`lr=1e-5`、`n_samples=4`、`max_new_tokens=64` → 提为 CLI 参数，默认值不变，这样 P3 的 256 / 512 token 实验不用改代码。
-- 完成条件：`tests/test_async_policy_example_cpu.py` 覆盖参数解析；Modal `example` 阶段重跑通过。
+- [ ] 先确认逐组小请求是否限制生成卡吞吐，确定批处理行数和显存上限。优先采用一个 session 生成多个完整 group 的方案，接口细节沿现有契约设计。
+- [ ] 实现 group 展开/还原与结果映射：每组仍占一个 K 许可；整个生成批次捕获同一策略版本；每组独立 reward/advantage；Q 仍按训练 batch 计数，保持原 optimizer step 边界。
+- [ ] 补 CPU 用例覆盖不完整尾批、乱序返回映射、组内 advantage、版本、部分失败、取消、许可归还和同步优先级。不能直接移除单 session 守卫；不能等满批导致 EOF 或同步死锁。
+- [ ] 对默认 K=1 做回归；对多组路径至少做 3 个种子的配对 GPU 对照，比较生成/训练吞吐、显存、丢弃率及相同评测预算下的质量。
 
-### U2 PR 拆分
+**验收：** 语义与退出检查通过、默认路径无新增回归。性能收益不明显时保留实验开关或撤回优化，不将未证明有效的路径设为默认。设计细节参照[已有草案](EXTENSION_DESIGN.md)，无需再新建设计报告。
 
-本地分支、提交、实际依赖和各分支验证记录见 [PR_SERIES.md](PR_SERIES.md)。尚未对外创建 PR。
+### T09 · P0：最终回归与上游 PR 交付（原 U2）
 
-建议顺序与依赖：
+**依赖：提交内容稳定；PR 1–3 的独立修复可先推进，不必等待整个性能矩阵。**
 
-1. **`fix(cuda)`: `sampling_params.seed` 透传**。`generation.py` 1 行 + 已有 CPU 测试。无依赖，可最先合，也可中选前作为社区贡献。
-2. **`feat(engine)`: cluster 公开接口**（U1 第 1–3 步）+ `SAVE_TRAINING_STATE` / `LOAD_TRAINING_STATE` + `training_state.py`。无依赖。
-3. **`feat(experimental)`: `async_policy` 核心**：`contracts` / `coordination` / `lifecycle` / `bridge` / `data` / `pipeline` + `test_async_policy_contracts_cpu.py` + `test_async_policy_core_cpu.py` + U4 的 concepts 页。描述含 U7 的对照表。无依赖。
-4. **`feat(experimental)`: native 适配 + 示例**：`native.py`（U1 第 4–5 步之后）+ `examples/async_policy/` + U5 归位后的工具 + U4 的 cookbook 页 + `test_async_policy_native_cpu.py` / `example` / `benchmark`。实际分支合并 1/2/3，包含同步对照所需的 seed 修复。
+- [ ] 固定最终提交，运行完整 CPU suite 并对比 `a35a580` 的失败集合和原有测试 node IDs；解释已有 12 个失败，修复新增失败。运行相关 Ruff、diff check；修改用户文档时再做 Sphinx 检查。
+- [ ] 检查四个 review 分支的差异与依赖：seed `b84e509`、engine `ac0cd7c`、core `44fe9ac`、native 当前 `d4fcc03`。新修复进入对应分支；PR 4 依赖前 3 个，排除项目过程文档与 `runs/`。
+- [ ] 按代码变化选择 GPU 回归：工具改动验收 T01/T02；生命周期改动重跑故障回收；生成/训练改动补相应同步对照和续训。已有其他提交的通过记录不冒充最终提交结果。
+- [ ] 更新现有四份 PR 描述，附具体提交、验证范围和全参数限制，再发布 PR 并处理评审/CI。PR 创建、CI 通过、维护者合并分别记录状态。
 
-- 完成条件：四个分支各自 `git diff upstream/main --stat` 不含 `docs/projects/`、`runs/`、`REWRITE_START.md`；每个 PR 描述写明依赖与验证命令。
+**验收：** 本地可交付版本有可复现验证和明确限制；对外 PR 有链接且比较基线正确。维护者合并属于外部进度，不据此将本地工程长期标为“没做完”。
 
-## 3. P1：吞吐（P）
+### T10 · P1：补齐全参数原始状态备份与资源收尾（原 H3）
 
-- [ ] **P1 生成侧并发。** `begin_rollout` 用单个 bool 互斥，K>1 只让 CPU 评分与生成重叠，GPU 上仍是一个 prompt group 一次 session。L4 生成卡利用率仅 20%。
-  - 方案 A：一次 `generate` 打包多个 prompt group（改 `RolloutPayload` 行数），K 语义不变。
-  - 方案 B：允许多 session 并发（rollout 引擎自身的 `max_running_prompts` 已支持）。
-  - 完成条件：同资源下生成 token/s 提升有数据；stale 率不恶化。
-- [x] **P2 同步不等待在途 rollout（本阶段仅设计）。** lag=1 三轮同步准入等待合计约 100 s / 50 updates。
-  - 方案：rollout 侧双缓冲权重，生成边界切换；或把同步放到生成结束事件上而不是训练结束。首版明确不做，先写设计草案与预期收益。
-- [ ] **P3 对齐官方动机场景的 benchmark。** 现有 benchmark 是 64 token 短输出。补 `max_new_tokens ∈ {256, 512}`、`n_samples ∈ {4, 8}`，这是"长输出 RLVR"与"大 n_samples"的原始动机；不同长度的收益方向不能预设；流水线平衡、同步和内存开销需实测。
-- [ ] **P4 恢复原 T14 的扫描矩阵。** C ∈ {1,2,4}、Q ∈ {1,2,4}、K ∈ {1,2}，每配置 ≥3 次；扫描固定 lag=4，避免 C=4 被 lag=1 提前触发。当前仅实验入口已准备。
+**依赖：每批实验结束即执行。**
 
-## 4. P1：范围扩展（E）
+- [x] 对照 Volume 中 `resume-full-852d88de8e85-62582a6925dd/`，清点可恢复 checkpoint 的模型、优化器、RNG、manifest 和审计结果。原始优化器约 8.4 GiB，当前本地 reports 备份不能代替它。
+- [ ] 检查实验盘空间，通过 CPU/下载工具补齐原始状态并逐文件验证 SHA-256；抽查可读取与恢复所需文件齐全。已有 384 文件备份无需重复复制。
+- [ ] 每批结束核对本项目 App 无运行任务、归档实际运行时长和可取得的费用记录。备份验证后只清理明确重复/失败产物，保留所需 checkpoint 与 ModelScope 缓存；整卷删除独立处理。
 
-- [ ] **E1 GSPO 异步。** `native.train` 的 `loss_fn` 参数化后跑 `gspo_loss_fn`，复用同一 benchmark。
-- [ ] **E2 全参数续训。** `training_state` 要求 TP=1/DP=1；`full-01` 只做了训练 + 同步，未做 resume。补一次全参数 save / resume 对照。
-- [x] **E3 Agentic 轨迹接入设计。** `features` 目前直接拒绝；官方背景把 agentic 列为动机之一。先写清接入点（`prompt_features_by_dp`、loss mask），不急于实现。
-- [x] **E4 TP>1 / DP>1 接入设计。** 首版明确不支持；记录需要改动的位置（`ClusterPartition`、`training_state._identity`）。
+**验收：** 声称可恢复的 checkpoint 有完整且校验过的备份；结果包含失败与中断记录；无遗留项目 GPU 任务。
 
-## 5. P0：OSPP 流程（O）
+## 3. 执行顺序与工作量
 
-按原 TODO v2 第 0 节，这些一项都没动，而它们决定代码是否计入结项。
+**下一步先做 T01/T02 的本地代码与 CPU 验证，再运行小规模 GPU 验收。** 全参数问题走 T03 独立分支，LoRA 主线可继续；随后分批完成 T04/T05/T06，利用测量结果推进 T07/T08。T09 的独立 PR 准备与 T10 可以穿插进行。
 
-- [ ] **O1 导师对齐（原 T00.2）。** 带上现有证据：CPU 契约、双 L4 结果、1.396× 与种子 43 退化、U1/U3 两个接口问题。三个问题：PR #480 定位、bridge 直接驱动 worker 是否可接受、`async-grpo` 注册是否期望。
-- [ ] **O2 申请书（原 T00.3）。** 以本表第 1–3 节为"计划"部分；已完成部分如实写为"中选前的准备工作"。
-- [ ] **O3 开 PR 时机。** 规则：中选前提交的 PR 不计入结项。选项：中选前只开 U2-1（seed 修复，作为社区贡献）与设计 issue；主体 PR 中选后开。与导师确认。
-- [x] **O4 结项报告草稿。** 四部分：已完成、问题与解决、测试用例、后续安排；从 REWRITE_TODO 与本表直接抽取。
+当前 `matrix.py` 的默认计划已通过读取 `build_jobs()` 核对：
 
-## 6. 收尾（H）
+| 套件 | 当前分组任务数 | 训练次数 | 本 TODO 采用的评测 |
+|---|---:|---:|---|
+| quality | 10 | 40 | 128 题 × 64/256 |
+| gspo | 6 | 12 | 128 题 × 64/256 |
+| throughput | 12 | 24 | 128 题 × 256 |
+| capacity | 57 | 57 | 128 题 × 256 |
+| 合计 | **85** | **133** | 训练与评测拆开执行 |
 
-- [x] **H1 旧 worktree 归档。** `feat-async-trainer` 的未提交 `docs/projects/` 与 `tests/async_policy_validation/` 是原型审计的历史版本；把 `REWRITE_ASSESSMENT.md` 与 `evidence/` 提交到资料分支 `docs/ospp-async-policy`，其余不再维护；分支加 `archive/` 前缀或在 README 标注。
-- [x] **H2 原始结果备份。** `runs/async-policy-rewrite/` 含 1.1 GiB trace 与全部 JSON，不在 Git；拷到实验盘并记录路径。
-- [ ] **H3 Modal Volume。** `areno-async-policy-r4` 保留模型缓存与结果；确认是否持续计费，不用时删除。
+现有执行方式还会做 **436 次评测遍历、55,808 条回答**，包含重复 base 评测。T02 完成后，若所有环境与评测指纹兼容，上表需要 185 次 checkpoint 评测加 2 次共享 base 评测；追加截断诊断另计。
 
-## 7. 建议顺序
+时长依据：已有 off-policy 两个 case 加 128 题评测耗时约 587 s；GSPO 两个 case 加 32 题评测约 633 s；全参数三路对照约 468 s；旧 checkpoint 的八次重评约 923 s（单 L4）。这些是成功子进程的 wall time，未包含全部启动、收集和抢占重试成本。
 
-1. 本地先完成源码审查、U1/U4/U5/U6、Q2 可选实现与 U2 分支，准备 O1/O2/O4 草稿。本轮已完成这些准备。
-2. 用户确认 GPU 资源和首轮预算后，按 [GPU 计划](GPU_VALIDATION_PLAN.md) 跑新提交的六项验收；失败先修，不展开矩阵。
-3. 种子 43 pilot 通过后执行 Q1/Q2 完整对照，再按实测资源需求推进 P3/P4/E1；E2 已纳入首轮续训验收。
-4. OSPP 状态和导师收件人确认、获得发送授权后，再对外沟通；主体 PR 节奏依据真实项目状态决定。
-5. P1 根据实测瓶颈选择方案；P2/E3/E4 本阶段保持设计交付。
+仅按 `133 ÷ 2 × 587 s` 外推，原执行方式就是约 **10.8 双卡容器小时（21.7 GPU 小时）**的工作量级；长输出、大采样和拆分/缓存都会改变实际时间，需要 pilot 后重新估算，不能把完整矩阵当成一次短验证。
 
-## 8. 2026-09-16 执行记录
+**建议执行边界：** 延续已有 Modal 双 L4，单任务最多 20 分钟、每批最多 2 小时、同时最多一个训练任务；将这些上限写入可检查的执行清单，达到上限保存进度。此处是后续执行参数建议，不是已发生的费用或新增预算批准；金额按实际运行时定价与用量核算。每批结束更新本表状态和结果索引即可。
 
-- 本地实现提交 `f217bac`；四个 review 分支为 `b84e509` / `ac0cd7c` / `44fe9ac` / `2b0575a`，附四份英文 PR 草稿，未推送或发布。
-- 最终完整 CPU：921 passed、12 failed、10 skipped；12 个失败与基线完全一致。原 911 个 node ID 全部保留，新增 32；变更涉及的测试模块 149 项全部通过。证据见 [next-stage-validation](evidence/next-stage-validation.md)。
-- 英文文档基线/候选/PR 3/PR 4 构建无警告；本轮 Python 改动 Ruff 和四分支 diff check 通过。
-- Q2/E1：可选 offpolicy loss、GSPO 注入与原 S1 数值 oracle 已验证；Q1/Q2/P3/P4/E1 的 GPU 矩阵未运行。
-- P2/E3/E4：仅完成 [扩展设计](EXTENSION_DESIGN.md)，没有实现生成双缓冲、Agentic 或多 rank 支持。
-- O1/O2/O3/O4：见 [OSPP_HANDOFF](drafts/OSPP_HANDOFF.md)；草稿不代表发送、申请提交或正式结项。
-- H1：资料分支 `docs/ospp-async-policy` 的 `612bffc` 归档 8 个原文件并核对 hash；原 dirty worktree 保留。
-- H2：760 个原始结果文件、7,616,137,087 bytes 已复制到实验盘镜像外并逐项验证 SHA-256。另补备份本轮 next-stage 的 753 个文件、50,596,664 bytes，同样逐项校验。路径与清单见 `runs/async-policy-rewrite/next-stage/backup-summary.json` 和 `next-stage-backup-summary.json`；可重建工具环境不在结果备份内。
-- H3：活动 App 列表没有本项目任务，缓存卷保留用于待跑实验。2026-09-16 查询 Modal 官方定价：Volumes $0.09/GiB/月，含 1 TiB/月免费额；账号总存储用量与最终账单未核定，不声称永久免费。
+## 4. 明确留在后续范围的内容
+
+以下不作为当前首版工程验收的前置条件；原有设计已完成，不能将“未实现”与“忘记完成”混在一起：
+
+- **SDK/CLI 注册 `async-grpo`：** 先解决 `Trainer` / backend 生命周期和配置所有权，避免双重启动 worker；不能只补一行注册。
+- **生成侧权重双缓冲：** 需要一致快照、发布边界、KV/LoRA/graph 指针版本及显存预算；先完成 T06 的收益测量。
+- **Agentic / 多模态、TP>1 / DP>1：** 保留 text-only、每角色单 GPU 限制；扩展需独立的轨迹 mask、版本和分片 checkpoint 验收。
+
+本表不包含 OSPP 申请、导师沟通、结项或发布时间流程。

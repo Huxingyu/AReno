@@ -20,4 +20,4 @@ across different execution schedules.
 ## Dependencies
 
 None. The diff contains only `generation.py` and its direct CPU test. Base:
-`48d07c5`. Local branch: `review/async-seed`. This description is unpublished.
+`48d07c5`. Local branch: `review/async-seed`.

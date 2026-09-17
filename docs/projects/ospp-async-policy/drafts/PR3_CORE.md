@@ -45,10 +45,10 @@ make -C docs html
 
 CPU coverage includes ordering, staleness admission, cancellation, payload
 snapshots, synchronization exclusion, exact loss/gradient checks, masks, and
-the S1 numerical oracle. The Sphinx HTML build completed without warnings.
+the S1 numerical oracle. The Sphinx HTML build completes with warnings treated as errors.
 GPU overlap, throughput, and training quality remain separate acceptance work.
 
 ## Dependencies
 
 None. Base: `48d07c5`. Local branch: `review/async-core`. Native worker integration
-and the runnable two-GPU recipe follow in PR 4. This description is unpublished.
+and the runnable two-GPU recipe follow in PR 4.

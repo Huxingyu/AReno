@@ -46,4 +46,4 @@ be rerun on this implementation before GPU acceptance is claimed.
 ## Dependencies
 
 None. Base: `48d07c5`. Local branch: `review/async-engine`. The native integration
-uses these interfaces in PR 4. This description is unpublished.
+uses these interfaces in PR 4.
