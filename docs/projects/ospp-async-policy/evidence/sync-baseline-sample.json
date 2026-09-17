@@ -1,0 +1,8 @@
+{
+  "adapter": "adapter/step_000003",
+  "prompt": "Calculate 2 + 2. Return the final answer in \\boxed{}.",
+  "completion": "We are given the expression:\n\n$$\n2 + 2\n$$\n\nPerforming the calculation:\n\n$$\n2 + 2 = 4\n$$\n\nSo the final answer is:\n\n$$\n\\boxed{4}\n$$",
+  "response_token_count": 47,
+  "reward": 1.0,
+  "scope": "Post-training reload sanity check; not an evaluation of quality improvement."
+}

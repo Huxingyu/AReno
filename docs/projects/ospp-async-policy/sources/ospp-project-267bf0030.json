@@ -1,0 +1,125 @@
+{
+  "programCode": "267bf0030",
+  "programName": "实现 AReno 原生异步策略训练器",
+  "programNameEN": "Implement an AReno-native async policy",
+  "programDesc": "<p><span style=\"color:#000000\"><strong>背景</strong></span></p><p><br/><span style=\"font-size:16px\"><span style=\"color:#333333\">AReno 当前的 GRPO/GSPO 实现共用 PolicyOnlyTrainer，每个 step 按顺序执行：</span></span></p><ol><li><span style=\"color:#333333\"><span style=\"font-size:16px\">rollout 生成 n_samples completions 或 agentic trajectories</span></span></li><li><span style=\"color:#333333\"><span style=\"font-size:16px\">reward function 评分</span></span></li><li><span style=\"color:#333333\"><span style=\"font-size:16px\">计算 group-relative advantages</span></span></li><li><span style=\"color:#333333\"><span style=\"font-size:16px\">构造 TrainSequence</span></span></li><li><span style=\"color:#333333\"><span style=\"font-size:16px\">调用 backend train 执行 optimizer step</span></span></li></ol><p><span style=\"color:#333333\"><span style=\"font-size:16px\">这个设计符合 AReno 的 single-node、self-contained 定位，容易理解和调试。但在下面这些场景中，同步 loop 会让 GPU 或 Python Runtime 出现明显等待：</span></span></p><ul><li><span style=\"color:#333333\"><span style=\"font-size:16px\">长输出 RLVR：max_new_tokens 较大，rollout 时间远高于 train 时间</span></span></li><li><span style=\"color:#333333\"><span style=\"font-size:16px\">Agentic RL：工具调用、环境交互、sandbox 操作、reward 计算可能成为瓶颈</span></span></li><li><span style=\"color:#333333\"><span style=\"font-size:16px\">单机多 GPU：有机会将 rollout engine 和 train engine 分配到不同设备组，形成本地异步流水线</span></span></li><li><span style=\"color:#333333\"><span style=\"font-size:16px\">大 n_samples：每个 prompt 需要采样多条 completion，rollout 阶段更容易成为端到端 step time 的主导项</span></span></li></ul><p><span style=\"color:#333333\"><span style=\"font-size:16px\">基于对业界其他开源后训练框架的调研分析，我们充分看到了异步 GRPO 的价值：通过后台 rollout worker、样本队列、staleness 控制和周期性权重同步，让 rollout 和 train 重叠执行。AReno 可以借鉴这一类系统思想，但需要保持 AReno-native：不依赖 vLLM/SGLang 等外部推理后端，不破坏本地一体化训练体验。</span></span></p><p></p><p><span style=\"color:#000000\"><strong>目标</strong></span><br/></p><p><span style=\"font-size:16px\"><span style=\"color:#333333\">实现 AReno-native async policy trainer，用于验证 rollout/train pipeline 并发是否能提升单机多 GPU 上的 RL 训练吞吐。</span></span><br/><span style=\"font-size:16px\"><span style=\"color:#333333\">该能力应优先作为 experimental feature 提供，例如：</span></span></p><ul><li><span style=\"color:#333333\"><span style=\"font-size:16px\">新增 areno.experimental.async_policy</span></span></li><li><span style=\"color:#333333\"><span style=\"font-size:16px\">注册实验性算法入口，例如 async-grpo / async-gspo</span></span></li><li><span style=\"color:#333333\"><span style=\"font-size:16px\">或提供 experimental trainer class，供 CLI/SDK 后续接入</span></span></li></ul>",
+  "programDescEN": "<p><span style=\"color:#000000\"><strong>Background</strong></span></p><p><br/><span style=\"font-size:16px\"><span style=\"color:#333333\">GSPO and GRPO currently share PolicyOnlyTrainer. Each step performs rollout, reward scoring, group-relative advantage calculation, train batch materialization, and then a backend training step.</span></span><br/><span style=\"font-size:16px\"><span style=\"color:#333333\">This is a good default for AReno’s single-node and self-contained positioning. However, for long-output RLVR, large n_samples, or agentic RL with slow tool/environment calls, the synchronous loop can leave training resources waiting for rollout or reward computation.</span></span><br/><span style=\"font-size:16px\"><span style=\"color:#333333\">Other open source project’s implementation demonstrates the value of decoupling generation and training through rollout workers, a ready-sample queue, staleness control, and periodic weight synchronization. AReno should explore the same system idea in an AReno-native way: no external vLLM/SGLang runtime dependency, no change to the stable default GRPO path, and no loss of local debuggability.</span></span><br/></p><p><span style=\"color:#000000\"><strong>Target</strong></span></p><p><br/><span style=\"font-size:16px\"><span style=\"color:#333333\">Build an experimental AReno-native async policy trainer that overlaps rollout/reward production with policy training on a single node. The first version should:</span></span></p><ul><li><span style=\"color:#333333\"><span style=\"font-size:16px\">live under areno.experimental</span></span></li><li><span style=\"color:#333333\"><span style=\"font-size:16px\">support GRPO first</span></span></li><li><span style=\"color:#333333\"><span style=\"font-size:16px\">reuse existing grpo_loss_fn</span></span></li><li><span style=\"color:#333333\"><span style=\"font-size:16px\">keep the design generic enough for GSPO later</span></span></li><li><span style=\"color:#333333\"><span style=\"font-size:16px\">use bounded queues and explicit staleness control</span></span></li><li><span style=\"color:#333333\"><span style=\"font-size:16px\">support local rollout/train resource separation</span></span></li><li><span style=\"color:#333333\"><span style=\"font-size:16px\">keep existing synchronous GRPO/GSPO behavior unchanged</span></span></li></ul>",
+  "outputRequirement": [
+    {
+      "title": "",
+      "children": []
+    },
+    {
+      "title": "1. 设计并实现 experimental async policy trainer",
+      "children": []
+    },
+    {
+      "title": "2. 实现 rollout worker 与 train loop 的生命周期管理",
+      "children": []
+    },
+    {
+      "title": "3. 实现 AReno-native 权重同步方案",
+      "children": []
+    },
+    {
+      "title": "4. 新增最小 smoke recipe，说明如何在单机多 GPU 上试跑 experimental async GRPO",
+      "children": []
+    },
+    {
+      "title": "5.新增 bounded queue 配置",
+      "children": []
+    }
+  ],
+  "outputRequirementEN": [
+    {
+      "title": "",
+      "children": []
+    },
+    {
+      "title": "1. Experimental async policy trainer implementation",
+      "children": []
+    },
+    {
+      "title": "2. Rollout worker lifecycle management",
+      "children": []
+    },
+    {
+      "title": "3. Weight sync mechanism suitable for AReno’s local backend",
+      "children": []
+    },
+    {
+      "title": "4. Documentation and a minimal smoke recipe",
+      "children": []
+    },
+    {
+      "title": "5. Config knobs for queue size, inflight rollout work, and weight sync cadence",
+      "children": []
+    }
+  ],
+  "techRequirement": [
+    {
+      "title": "",
+      "children": []
+    },
+    {
+      "title": "1. 熟悉 Python async / multiprocessing / queue backpressure",
+      "children": []
+    },
+    {
+      "title": "2. 熟悉 GRPO/GSPO 的 rollout logprobs、advantages 和 loss 输入语义",
+      "children": []
+    },
+    {
+      "title": "3. 熟悉 PyTorch checkpoint/state_dict 或分布式权重同步基础",
+      "children": []
+    },
+    {
+      "title": "4. 熟悉单机多 GPU 资源划分和 CUDA worker 生命周期",
+      "children": []
+    },
+    {
+      "title": "5. 熟悉 AReno Trainer、PolicyOnlyTrainer、algorithm registry 和 backend lifecycle",
+      "children": []
+    }
+  ],
+  "techRequirementEN": [
+    {
+      "title": "",
+      "children": []
+    },
+    {
+      "title": "1. Python async and multiprocessing",
+      "children": []
+    },
+    {
+      "title": "2. GRPO/GSPO loss input semantics",
+      "children": []
+    },
+    {
+      "title": "3. PyTorch model state or checkpoint synchronization",
+      "children": []
+    },
+    {
+      "title": "4. Single-node multi-GPU resource management",
+      "children": []
+    },
+    {
+      "title": "5. AReno trainer/backend lifecycle",
+      "children": []
+    }
+  ],
+  "repo": [
+    "https://github.com/inclusionAI/AReno/"
+  ],
+  "_provenance": {
+    "retrieved_on": "2026-09-13",
+    "endpoint": "https://summer.ospp.ac.cn/api/getProDetail",
+    "method": "POST",
+    "request": {
+      "programId": "267bf0030",
+      "type": "org"
+    },
+    "scope": "Requirement fields extracted without rewriting from the official response.",
+    "complete_local_response_sha256": "7a9188116bf18c9f16ff9459f733f809d842f91ac968be2ee7bf45695f488f1f"
+  }
+}
