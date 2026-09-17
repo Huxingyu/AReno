@@ -101,6 +101,22 @@ def link_extension(*repos):
         log(f"extension -> {dest}")
 
 
+def stub_flash_attn_metadata():
+    """gpu_run.py records importlib.metadata.version("flash-attn") unconditionally.
+    T4 (sm_75) cannot run flash-attn and the native backend never imports it, so
+    register an empty distribution whose version documents its absence."""
+    import importlib.metadata, site
+    try:
+        importlib.metadata.version("flash-attn"); return
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    site_dir = Path(site.getsitepackages()[0]) / "flash_attn-0.0.0+absent_t4.dist-info"
+    site_dir.mkdir(parents=True, exist_ok=True)
+    (site_dir / "METADATA").write_text("Metadata-Version: 2.1\nName: flash-attn\nVersion: 0.0.0+absent_t4\n")
+    (site_dir / "RECORD").write_text("")
+    log("registered stub flash-attn metadata (not importable; native backend only)")
+
+
 def torch_tag():
     import torch
     return f"torch{torch.__version__}-py{sys.version_info.major}{sys.version_info.minor}"
@@ -184,6 +200,7 @@ def restore_build():
     tree = sorted(str(p.relative_to(INPUT)) for p in INPUT.rglob("*") if p.is_file())[:40] if INPUT.exists() else []
     log(f"/kaggle/input files (first 40): {tree}")
     install_runtime_deps()
+    stub_flash_attn_metadata()
     if BUILD_INPUT is None:
         model = build_inplace()
         link_extension(SRC.parent / "src-batched", SRC.parent / "src-deterministic")
@@ -257,12 +274,8 @@ def role_lane0():
     gpu_info()
     repo, det_repo, model = restore_build()
     out = WORK / "campaign"; out.mkdir(exist_ok=True)
-    # T6: strict full-parameter resume, seed 43, on the deterministic branch.
-    sh([sys.executable, "examples/async_policy/tools/resume_run.py", "--model-path", str(model),
-        "--output-dir", str(out / "resume-full-seed43"), "--full-parameters", "--seed", "43",
-        "--deterministic", "--audit-each-step"], cwd=det_repo, check=False, timeout=3600)
-    for big in (out / "resume-full-seed43").rglob("checkpoint-*"):
-        shutil.rmtree(big, ignore_errors=True)  # keep audits/hashes, drop multi-GB optimizer states
+    # T6 (strict full-parameter resume) is NOT run here: fp32 full parameters +
+    # fp32 optimizer state OOM on a 15 GB T4 (lane0 v2, 2026-09-17). Keep it on Modal L4.
     # T7: regression against the upstream baseline, sharing the built extension.
     baseline = SRC.parent / "areno-upstream"
     if not baseline.exists():
