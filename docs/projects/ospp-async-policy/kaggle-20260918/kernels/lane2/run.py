@@ -1,9 +1,9 @@
-"""AReno async-policy campaign runner for Kaggle (2x T4, fp16).
+"""AReno async-policy campaign runner for Kaggle (2x T4, fp32).
 
 Generated from kernel_template.py by gen.py; LANE is substituted per kernel.
 Roles:
   build  - clone repo, build CUDA extension wheel for sm_75, fetch Qwen3-0.6B,
-           write an fp16 copy of the model config, run one smoke job.
+           write an fp32 copy of the model config, run one smoke job.
   laneN  - mount the build output, install wheel, run matrix.py --backend local.
   lane0  - strict full-parameter resume seed43 (deterministic branch) and the
            regression / faults / extended-faults GPU suites.
@@ -96,18 +96,18 @@ def torch_tag():
     return f"torch{torch.__version__}-py{sys.version_info.major}{sys.version_info.minor}"
 
 
-def fp16_model(src_model: Path, dest: Path):
-    """Copy the model directory and switch torch_dtype to float16 for T4."""
+def fp32_model(src_model: Path, dest: Path):
+    """Copy the model directory and switch torch_dtype to float32 for T4."""
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(src_model, dest, symlinks=False)
     cfg_path = dest / "config.json"
     cfg = json.loads(cfg_path.read_text())
-    cfg["torch_dtype"] = "float16"
+    cfg["torch_dtype"] = "float32"
     cfg.pop("dtype", None)
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
-    (dest / "AREN0_FP16_NOTE.txt").write_text(
-        "Copied from %s; torch_dtype forced to float16 because T4 (sm_75) lacks bf16.\n" % src_model)
+    (dest / "ARENO_FP32_NOTE.txt").write_text(
+        "Copied from %s; torch_dtype forced to float32: T4 lacks bf16 and the fused AdamW kernels reject float16.\n" % src_model)
     return dest
 
 
@@ -134,7 +134,7 @@ def role_build():
     link_extension(repo)
     from huggingface_hub import snapshot_download
     raw = Path(snapshot_download(MODEL_ID, cache_dir=str(WORK / "hf-cache")))
-    model = fp16_model(raw, WORK / "model-fp16")
+    model = fp32_model(raw, WORK / "model-fp32")
     shutil.rmtree(WORK / "hf-cache", ignore_errors=True)
     log(f"model ready at {model}")
     # Source snapshots for the lanes (batched + deterministic) so lanes do not
@@ -144,7 +144,7 @@ def role_build():
         link_extension(d)
         with tarfile.open(WORK / name, "w") as tar:
             tar.add(d, arcname=name.replace(".tar", ""))
-    # Smoke job: one quality config, sync + lag1, validates fp16 training on T4
+    # Smoke job: one quality config, sync + lag1, validates fp32 training on T4
     # and gives an L4-comparable point (seed41 tokens64: L4 bf16 got 0.664 / 0.680).
     out = WORK / "smoke"
     sh([sys.executable, "examples/async_policy/tools/matrix.py", "--suite", "quality", "--model-path", str(model),
@@ -166,7 +166,7 @@ def restore_build():
     for name in ("src-batched", "src-deterministic"):
         with tarfile.open(BUILD_INPUT / f"{name}.tar") as tar:
             tar.extractall(SRC.parent)
-    model = fp16_model(BUILD_INPUT / "model-fp16", WORK / "model-fp16")
+    model = fp32_model(BUILD_INPUT / "model-fp32", WORK / "model-fp32")
     link_extension(SRC.parent / "src-batched", SRC.parent / "src-deterministic")
     return SRC.parent / "src-batched", SRC.parent / "src-deterministic", model
 
@@ -262,5 +262,5 @@ if __name__ == "__main__":
         else:
             role_lane(int(LANE[-1]))
     finally:
-        shutil.rmtree(WORK / "model-fp16", ignore_errors=True) if LANE != "build" else None
+        shutil.rmtree(WORK / "model-fp32", ignore_errors=True) if LANE != "build" else None
         log("done")
