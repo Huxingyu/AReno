@@ -20,8 +20,18 @@ UPSTREAM = "https://github.com/inclusionAI/AReno.git"
 MODEL_ID = "Qwen/Qwen3-0.6B"
 WORK = Path("/kaggle/working")
 INPUT = Path("/kaggle/input")
-BUILD_INPUT = next(iter(INPUT.glob("areno-kaggle-build*")), None)
-STATE_INPUT = next(iter(INPUT.glob("areno-campaign-state*")), None)
+def _find_input(marker: str, depth: int):
+    """Locate a mounted kernel/dataset output by a marker file, whatever Kaggle names the mount."""
+    for hit in INPUT.rglob(marker):
+        base = hit
+        for _ in range(depth):
+            base = base.parent
+        return base
+    return None
+
+
+BUILD_INPUT = _find_input("TORCH_TAG", 2)          # <mount>/wheels/TORCH_TAG
+STATE_INPUT = _find_input("campaign-state.marker", 1)
 SRC = Path("/kaggle/tmp/areno"); SRC.parent.mkdir(parents=True, exist_ok=True)
 STARTED = time.time()
 BUDGET_S = int(os.environ.get("ARENO_KAGGLE_BUDGET_S", str(int(10.5 * 3600))))  # stay under the 12 h session cap
@@ -156,9 +166,29 @@ def role_build():
 
 
 # ----------------------------------------------------------------------------- lanes
+def build_inplace():
+    """Fallback when the build kernel output is not mounted: rebuild here (~7 min)."""
+    log("build output not mounted; rebuilding in this session")
+    repo = checkout(BATCHED_SHA, SRC.parent / "src-batched")
+    checkout(DETERMINISTIC_SHA, SRC.parent / "src-deterministic")
+    wheels = WORK / "wheels-local"; wheels.mkdir(exist_ok=True)
+    sh([sys.executable, "-m", "pip", "wheel", "-q", "--no-build-isolation", "--no-deps", "-w", str(wheels), str(repo)],
+       env={"TORCH_CUDA_ARCH_LIST": "7.5", "MAX_JOBS": "4", "ARENO_BUILD_EXT": "1"}, timeout=3600)
+    pip("--no-deps", str(next(wheels.glob("areno-*.whl"))))
+    from huggingface_hub import snapshot_download
+    raw = Path(snapshot_download(MODEL_ID, cache_dir="/kaggle/tmp/hf-cache"))
+    return fp32_model(raw, WORK / "model-fp32")
+
+
 def restore_build():
-    assert BUILD_INPUT, "attach the build kernel output as a kernel source"
+    tree = sorted(str(p.relative_to(INPUT)) for p in INPUT.rglob("*") if p.is_file())[:40] if INPUT.exists() else []
+    log(f"/kaggle/input files (first 40): {tree}")
     install_runtime_deps()
+    if BUILD_INPUT is None:
+        model = build_inplace()
+        link_extension(SRC.parent / "src-batched", SRC.parent / "src-deterministic")
+        return SRC.parent / "src-batched", SRC.parent / "src-deterministic", model
+    log(f"build input at {BUILD_INPUT}")
     tag = (BUILD_INPUT / "wheels" / "TORCH_TAG").read_text().strip()
     if tag != torch_tag():
         raise SystemExit(f"wheel built for {tag} but session has {torch_tag()}; rebuild")
@@ -173,8 +203,8 @@ def restore_build():
 
 def restore_state(campaign: Path):
     """Resume: copy a prior run's campaign directory so matrix.py skips done jobs."""
-    if STATE_INPUT and (STATE_INPUT / "campaign").exists():
-        shutil.copytree(STATE_INPUT / "campaign", campaign, dirs_exist_ok=True)
+    if STATE_INPUT and STATE_INPUT.exists():
+        shutil.copytree(STATE_INPUT, campaign, dirs_exist_ok=True)
         log(f"restored prior campaign state from {STATE_INPUT}")
 
 
@@ -202,6 +232,7 @@ def summarize(campaign: Path):
         except Exception:
             pass
     (WORK / f"{LANE}-summary.json").write_text(json.dumps(rows, indent=1))
+    (campaign / "campaign-state.marker").write_text(LANE + "\n")
     log(f"summary: {len(rows)} rows -> {LANE}-summary.json")
 
 
