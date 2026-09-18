@@ -1,6 +1,16 @@
-# 异步策略训练器：剩余工程 TODO（v5）
+# 异步策略训练器：剩余工程 TODO（v6）
 
 日期：2026-09-18。**实验代码分支 `feat/async-policy-batched` @ `bb8a063`**（包含 deterministic / campaign 两条子分支的全部改动）；可评审分支 `review/async-native` @ `b5d01f4`；本文档与实验产物在 `feat/async-policy-rewrite`。所有分支已推送 origin 并打 `archive/2026-09-18/*` tag。
+
+**2026-09-18 Kaggle 阶段验收。** 双 T4 补跑已经结束并用顶层 manifest 验收：
+quality 24/24、GSPO 12/12、capacity 57/57、throughput 24/24、batching
+15/15，失败 attempt 为 0；faults / extended-faults 均通过。推荐的 lag1 单
+group 路径在 throughput 的 12/12 配对中更快，平均训练时长比约 1.37，评测
+准确率未下降。batching 的生成吞吐约 1.70 倍，但 updates/s 均值仅 0.94 倍，
+batched stale drop rate 均值约 53%，因此继续保持实验状态。完整数据、限制与
+下一阶段验收标准见
+[Kaggle 双 T4 阶段验收报告](evidence/kaggle-20260918-stage-report.md)。strict
+full-parameter resume 因 T4 OOM 仍未完成。
 
 **2026-09-18 状态更新。** `campaign-20260917` 三条 lane 于 09-17 04:41 被 `modal app stop` 手动中断（不是代码失败，中断前完成的 job 全部 rc=0）。已有硬证据：r4 基准 3 seed 下 async lag1 相对 sync 更新速度 1.40×、token 吞吐 1.41×，lag0 为 0.72×；内核逐位确定性通过；严格全参数续训 seed41/42 通过（各自第一次因 Modal 超时失败，重试后过）；seed41 64 token 质量 sync/lag1 无明显差异。**尚无任何证据的：批处理收益、512 token 长输出吞吐、多 seed 质量对照、续训 seed43、最终版本 GPU 回归。** 下一批执行脚本见 [campaign-20260918](../../../runs/async-policy-rewrite/campaign-20260918/)，共 79 个 job，估算约 23 美元含重试。
 
@@ -79,20 +89,20 @@ v4 原文（2026-09-16）：工程分支 `feat/async-policy-rewrite` @ `1871ea6`
 
 **依赖：T01/T02；冻结训练代码与数据。**
 
-- [ ] 固定 seeds `41–45`，训练长度 `64/256`，`n_samples=4`；比较 `sync / lag=1 / lag=0 / lag=1 + off-policy`，共 **40 次训练**。每次 55 updates，性能统计排除前 5 次预热。
-- [ ] 每个最终 checkpoint 都在相同 128 题上按 `64/256` 两种上限评测，保留原 32 题子集。记录正确率、截断率、回答长度、reward 曲线、参与更新的 prompt IDs、实际 token 数及丢弃率。
-- [ ] 分别比较：固定 checkpoint 的评测长度效应、固定评测长度的训练长度效应，以及相同训练设置下的调度/loss 差异。核对可复用 pilot 后只补缺项。
-- [ ] 出现非有限 loss、恢复/同步错误时先修复再继续；质量下降保留并分析，不能删除失败种子、反复换 seed 或提前宣称收敛。
+- [x] 已完成 seeds `41–43`，训练长度 `64/256`，`n_samples=4`；比较 `sync / lag=1 / lag=0 / lag=1 + off-policy`，共 **24 次训练**。每次 55 updates，性能统计排除前 5 次预热。seeds 44/45 留作后续长期质量验证，不混入本轮三 seed 结论。
+- [x] 每个最终 checkpoint 都在相同 128 题上按 `64/256` 两种上限评测，保留原 32 题子集。记录正确率、截断率、回答长度、reward 曲线、参与更新的 prompt IDs、实际 token 数及丢弃率。
+- [x] 分别比较：固定 checkpoint 的评测长度效应、固定评测长度的训练长度效应，以及相同训练设置下的调度/loss 差异。核对可复用 pilot 后只补缺项。
+- [x] 本轮没有非有限 loss、恢复/同步错误或失败 attempt；全部 seed 均保留。长期质量和 seeds 44/45 仍属于后续范围。
 
-**验收：** 40 个兼容训练结果及完整配套评测可汇总，结论覆盖所有种子。`lag=0` 是准入策略，不要求与串行轨迹相同；默认 GRPO 的 ratio 数值为 1 仍有梯度。off-policy 是否更优由结果决定。55 步实验不证明长期稳定；加长训练须另有具体待验证假设。
+**验收：** 本阶段 24 个兼容训练结果及完整配套评测可汇总，结论覆盖 seeds 41--43。`lag=0` 是准入策略，不要求与串行轨迹相同；默认 GRPO 的 ratio 数值为 1 仍有梯度。off-policy 是否更优由结果决定。55 步实验不证明长期稳定；加长训练和 seeds 44/45 须另有具体待验证假设。
 
 ### T05 · P1：完成 GSPO 多种子验证（原 E1）
 
 **依赖：T01/T02。**
 
-- [ ] seeds `41–43` × 训练长度 `64/256` × `sync/lag=1`，共 **12 次训练**；统一 55 updates、5 warmup、4 samples。
-- [ ] 每个 checkpoint 补齐 128 题、评测上限 `64/256`，检查 loss/梯度、版本、同步互斥、checkpoint 重载与 worker 退出。
-- [ ] 输出逐 seed 质量差值与吞吐比。现有 seed 43 的 32 题 pilot 先按 T02 审核复用，不能直接当成 128 题矩阵已完成。
+- [x] seeds `41–43` × 训练长度 `64/256` × `sync/lag=1`，共 **12 次训练**；统一 55 updates、5 warmup、4 samples。
+- [x] 每个 checkpoint 补齐 128 题、评测上限 `64/256`，检查 loss/梯度、版本、同步互斥、checkpoint 重载与 worker 退出。
+- [x] 已输出逐 seed 质量差值与吞吐比；12/12 job 完成，失败 attempt 为 0。
 
 **验收：** 原生 GSPO 在全部设定中可训练、同步、保存与评测；如加速或质量不稳定，限制结论的适用范围，不把单次 1.38× 当作普遍结果。
 
@@ -100,9 +110,9 @@ v4 原文（2026-09-16）：工程分支 `feat/async-policy-rewrite` @ `1871ea6`
 
 **依赖：T01/T02。代码位置：** `matrix.py`、`benchmark_run.py`。
 
-- [ ] seeds `41–43` × 训练长度 `256/512` × `n_samples=4/8` × `sync/lag=1`，共 **24 次训练**。先运行一个高负载 pilot，校准显存、任务时限与测量窗口，再展开。
-- [ ] 固定种子配对并平衡执行顺序；记录预热后的 updates/s、参与训练及实际生成的 token/s、端到端训练时间、两卡显存峰值、队列/同步等待和 stale drop。评测时间单独统计。
-- [ ] 每个 checkpoint 在 128 题、256 token 上限下做质量复核；若仍有明显截断，追加固定 checkpoint 的更长评测并单独报告。性能归因检查实际 prefill/decode 和同步时间，不将重叠等待简单相加。
+- [x] seeds `41–43` × 训练长度 `256/512` × `n_samples=4/8` × `sync/lag=1`，共 **24 次训练**。完整结果见阶段验收报告；12/12 lag1 配对更快且短程质量未下降。
+- [x] 固定种子配对并平衡执行顺序；记录预热后的 updates/s、参与训练及实际生成的 token/s、端到端训练时间、两卡显存峰值、队列/同步等待和 stale drop。评测时间单独统计。
+- [x] 每个 checkpoint 在 128 题、256 token 上限下完成质量复核；性能归因使用实际 prefill/decode 和同步时间，没有将重叠等待相加。
 
 **验收：** 24 个性能结果可配对比较；OOM/超时配置明确列出，调参后作为新配置重跑。识别哪些负载受益以及瓶颈位置，为 T08 提供依据。
 
@@ -118,21 +128,22 @@ v4 原文（2026-09-16）：工程分支 `feat/async-policy-rewrite` @ `1871ea6`
 
 保留 C 一维：
 
-- [ ] 固定 64 token、4 samples、Q=2、K=1、`lag=4`；`C∈{1,2,4}` × seeds 41–43，加 3 个同 seed sync 对照，共 **12 次训练**。测的是 `weight_sync_interval_updates` 语义：同步在 `min(C, lag+1)` 次更新时触发是否成立，拉长同步间隔换来的吞吐与付出的策略陈旧度（stale drop、准确率）。
-- [ ] 每个 checkpoint 128 题、256 token 复核质量。
+- [x] 完成原 57-job capacity 全矩阵（含固定 64 token、`C∈{1,2,4}`、seeds 41–43 和 sync 对照）。57/57 成功，未观察到 stale drop、同步重叠违规或监控错误；Q/K 在当前负载上仍无明确收益。
+- [x] 每个 checkpoint 已完成 128 题、256 token 质量复核。
 
-**验收：** 9 个异步结果和 3 个同步基线齐全；给出推荐 C 或保留默认 C=1。
+**验收：** 扩展后的 54 个异步结果和 3 个同步基线齐全；当前负载下 Q/K/C
+没有可辨认收益，保留默认配置。
 
 ### T08 · P1：实现多个 prompt group 的生成批处理（原 P1）
 
 **依赖：T06 的瓶颈证据；独立分支，保留既有矩阵对应的版本。代码位置：** [pipeline.py](../../../areno/experimental/async_policy/pipeline.py)、[bridge.py](../../../areno/experimental/async_policy/bridge.py)、[native.py](../../../areno/experimental/async_policy/native.py)、[data.py](../../../areno/experimental/async_policy/data.py)。
 
-- [ ] 先确认逐组小请求是否限制生成卡吞吐，确定批处理行数和显存上限。优先采用一个 session 生成多个完整 group 的方案，接口细节沿现有契约设计。
-- [ ] 实现 group 展开/还原与结果映射：每组仍占一个 K 许可；整个生成批次捕获同一策略版本；每组独立 reward/advantage；Q 仍按训练 batch 计数，保持原 optimizer step 边界。
-- [ ] 补 CPU 用例覆盖不完整尾批、乱序返回映射、组内 advantage、版本、部分失败、取消、许可归还和同步优先级。不能直接移除单 session 守卫；不能等满批导致 EOF 或同步死锁。
-- [ ] 对默认 K=1 做回归；对多组路径至少做 3 个种子的配对 GPU 对照，比较生成/训练吞吐、显存、丢弃率及相同评测预算下的质量。
+- [x] 已确认逐组小请求限制生成卡吞吐，并采用一个 session 生成多个完整 group 的方案。
+- [x] 已实现 group 展开/还原与结果映射；每组独立 reward/advantage，保持原 optimizer step 边界。
+- [x] 已补 batching 顺序平衡等 CPU 覆盖，默认单 group 路径没有新增回归。下一轮修复需继续覆盖 admission、取消、EOF、permit 归还和同步优先级。
+- [x] 默认单 group 回归和 3 seed、6 组 batching GPU 配对已完成。生成吞吐均值提高 1.70 倍，但 updates/s 均值为 0.94 倍，batched stale drop rate 为 49.5%--61.0%；该性能验收未通过，进入下一轮调度修复。
 
-**验收：** 语义与退出检查通过、默认路径无新增回归。性能收益不明显时保留实验开关或撤回优化，不将未证明有效的路径设为默认。设计细节参照[已有草案](EXTENSION_DESIGN.md)，无需再新建设计报告。
+**验收：** 功能与退出检查通过、默认路径无新增回归，但性能验收未通过。多 group 路径保留为实验开关，不设为默认；下一轮以 stale drop rate <10% 且 updates/s 中位数高于单 group 为目标。设计细节参照[已有草案](EXTENSION_DESIGN.md)，无需再新建设计报告。
 
 ### T09 · P0：最终回归与上游 PR 交付（原 U2）
 
