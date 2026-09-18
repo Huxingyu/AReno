@@ -370,3 +370,86 @@ class PolicyPipelineCoordinator:
         with self._cond:
             while self._rollout_active or self._train_active or self._plan is not None:
                 deadline.wait(self._cond)
+
+
+class LagBudgetLimiter:
+    """Keep accepted prompt groups inside the inclusive policy-lag window.
+
+    A reservation spans source admission through terminal training admission,
+    unlike ``InflightLimiter`` which ends after queue publication. Unbound
+    reservations have not started generation and follow the current rollout
+    version across a weight sync. Bound reservations retain the version that
+    actually generated their samples.
+    """
+
+    def __init__(self, coordinator: PolicyPipelineCoordinator, max_policy_lag: int | None):
+        self._coordinator = coordinator
+        self._max_policy_lag = max_policy_lag
+        self._cond = threading.Condition()
+        self._closed = False
+        self._next_token = 0
+        self._versions: dict[int, int | None] = {}
+
+    @property
+    def active(self) -> int:
+        with self._cond:
+            return len(self._versions)
+
+    def _fits(self, *, extra: int = 1) -> bool:
+        if self._max_policy_lag is None:
+            return True
+        state = self._coordinator.snapshot()
+        versions = [state.rollout_policy_version if version is None else version
+                    for version in self._versions.values()]
+        versions.extend([state.rollout_policy_version] * extra)
+        return state.train_policy_version + len(versions) - 1 - min(versions) <= self._max_policy_lag
+
+    def reserve(self, *, timeout_s: float | None = None) -> int:
+        deadline = Deadline(timeout_s)
+        with self._cond:
+            while True:
+                if self._closed:
+                    raise InflightClosed("lag-budget admission is closed")
+                if self._fits():
+                    token = self._next_token
+                    self._next_token += 1
+                    self._versions[token] = None
+                    return token
+                deadline.wait(self._cond)
+
+    def try_reserve(self) -> int | None:
+        """Reserve immediately, or return ``None`` when the lag window is full."""
+        with self._cond:
+            if self._closed:
+                raise InflightClosed("lag-budget admission is closed")
+            if not self._fits():
+                return None
+            token = self._next_token
+            self._next_token += 1
+            self._versions[token] = None
+            return token
+
+    def bind(self, token: int, policy_version: int) -> None:
+        with self._cond:
+            if token not in self._versions:
+                raise RuntimeError("unknown or released lag-budget reservation")
+            if self._versions[token] is not None:
+                raise RuntimeError("lag-budget reservation was bound more than once")
+            self._versions[token] = policy_version
+            self._cond.notify_all()
+
+    def release(self, token: int) -> None:
+        with self._cond:
+            if token not in self._versions:
+                raise RuntimeError("lag-budget reservation released more than once")
+            del self._versions[token]
+            self._cond.notify_all()
+
+    def notify_version_change(self) -> None:
+        with self._cond:
+            self._cond.notify_all()
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()

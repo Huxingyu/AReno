@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from areno.api.models import RolloutResult, RolloutSequence, SamplingParams
-from areno.experimental.async_policy import AsyncPolicyConfig, BatchContractError, DualEngineBridge
-from areno.experimental.async_policy.coordination import InflightClosed, InflightLimiter
+from areno.experimental.async_policy import (
+    AsyncPolicyConfig,
+    BatchContractError,
+    DeviceMode,
+    DualEngineBridge,
+    PolicyPipelineCoordinator,
+)
+from areno.experimental.async_policy.coordination import InflightClosed, InflightLimiter, LagBudgetLimiter
 from tests.async_policy_validation.fakes import FakeRolloutEngine, FakeTrainEngine, FakeWeightSync, ready_batch
 from tests.async_policy_validation.protocol_cases import assert_drained, config, pipeline, prompts
 from tests.test_async_policy_core_cpu import background, wait_for
@@ -54,6 +61,73 @@ def test_nonblocking_permit_does_not_wait_for_a_full_batch():
     assert limiter.active == 0
 
 
+def test_lag_budget_tracks_bound_versions_and_rejects_duplicate_ownership():
+    coordinator = PolicyPipelineCoordinator()
+    coordinator.attach(config(max_policy_lag=1), DeviceMode.ASYNC)
+    limiter = LagBudgetLimiter(coordinator, 1)
+    first = limiter.reserve()
+    second = limiter.try_reserve()
+    assert second is not None and limiter.try_reserve() is None
+    limiter.bind(first, 0)
+    with pytest.raises(RuntimeError, match="bound more than once"):
+        limiter.bind(first, 0)
+    limiter.release(first)
+    with pytest.raises(RuntimeError, match="released more than once"):
+        limiter.release(first)
+    limiter.release(second)
+
+
+def test_unbound_lag_budget_follows_a_new_rollout_version():
+    coordinator = PolicyPipelineCoordinator()
+    coordinator.attach(config(max_policy_lag=1, weight_sync_interval_updates=1), DeviceMode.ASYNC)
+    limiter = LagBudgetLimiter(coordinator, 1)
+    first = limiter.reserve()
+    admission = coordinator.begin_train(0)
+    assert admission.decision == "trained"
+    coordinator.end_train(stepped=True)
+    assert limiter.try_reserve() is None
+    plan = coordinator.begin_sync()
+    assert plan is not None
+    coordinator.end_sync(plan, succeeded=True)
+    limiter.notify_version_change()
+    second = limiter.try_reserve()
+    assert second is not None
+    limiter.bind(first, 1)
+    limiter.release(first)
+    limiter.release(second)
+
+
+def test_lag_budget_close_wakes_a_waiter():
+    coordinator = PolicyPipelineCoordinator()
+    coordinator.attach(config(max_policy_lag=0), DeviceMode.ASYNC)
+    limiter = LagBudgetLimiter(coordinator, 0)
+    token = limiter.reserve()
+    waiting = threading.Event()
+    original = limiter._cond.wait
+
+    def observed_wait(timeout=None):
+        waiting.set()
+        return original(timeout)
+
+    limiter._cond.wait = observed_wait
+    errors = []
+
+    def reserve():
+        try:
+            limiter.reserve(timeout_s=1)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=reserve)
+    thread.start()
+    assert waiting.wait(1)
+    limiter.close()
+    thread.join(2)
+    assert not thread.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], InflightClosed)
+    limiter.release(token)
+
+
 def test_batching_requires_adapter_support_before_initialization():
     rollout = FakeRolloutEngine()
     with pytest.raises(TypeError, match="generate_batch"):
@@ -92,6 +166,37 @@ def test_partial_tail_and_out_of_order_groups_keep_independent_advantages(count)
         assert [row.tokens[-2:] for row in batch.sequences] == [[index + 3, 0], [index + 3, 1]]
     if count > 1:
         assert train.batches[0].policy_version == train.batches[1].policy_version
+
+
+@pytest.mark.parametrize("cadence", [1, 2])
+def test_lag_budget_prevents_batched_overproduction(cadence):
+    class SlowTrain(FakeTrainEngine):
+        def train(self, batch, version, *, timeout_s=None):
+            time.sleep(0.005)
+            return super().train(batch, version, timeout_s=timeout_s)
+
+    train = SlowTrain()
+    pipe = pipeline(data=prompts(20), rollout=BatchedRollout(), train=train,
+                    cfg=config(queue_capacity=2, max_inflight_rollouts=2, rollout_batch_groups=2,
+                               weight_sync_interval_updates=cadence, max_policy_lag=1))
+    report = pipe.run()
+    assert report.steps == train.calls == report.produced_batches == 20
+    assert report.batches_dropped_stale == 0
+    assert all(metric.decision == "trained" for metric in report.batch_metrics)
+    assert_drained(pipe)
+
+
+@pytest.mark.parametrize(("lag", "largest_session"), [(0, 1), (1, 2)])
+def test_lag_budget_submits_partial_sessions_when_a_full_session_cannot_fit(lag, largest_session):
+    rollout = BatchedRollout()
+    pipe = pipeline(data=prompts(7), rollout=rollout,
+                    cfg=config(max_inflight_rollouts=3, rollout_batch_groups=3,
+                               weight_sync_interval_updates=1, max_policy_lag=lag))
+    report = pipe.run()
+    assert report.steps == report.produced_batches == 7
+    assert report.batches_dropped_stale == 0
+    assert max(map(len, rollout.groups)) == largest_session
+    assert_drained(pipe)
 
 
 @pytest.mark.parametrize("bad", ["missing", "extra", "bool_key", "version", "logprobs"])
