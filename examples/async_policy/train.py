@@ -93,7 +93,7 @@ def run_training(*, model_path: str, data_path: Path, output: Path, mode: str = 
                  lora_rank: int = 8, lora_alpha: float = 16, learning_rate: float = 1e-5,
                  n_samples: int = 4, max_new_tokens: int = 64, loss: str = "grpo",
                  queue_capacity: int = 2, max_inflight_rollouts: int = 1,
-                 weight_sync_interval_updates: int = 1) -> dict:
+                 weight_sync_interval_updates: int = 1, rollout_batch_groups: int = 1) -> dict:
     import torch
 
     from areno.adapters.config import LoraConfig
@@ -109,6 +109,8 @@ def run_training(*, model_path: str, data_path: Path, output: Path, mode: str = 
 
     if steps < 1 or mode not in {"sync", "async"}:
         raise ValueError("positive steps and mode sync/async are required")
+    if mode == "sync" and rollout_batch_groups != 1:
+        raise ValueError("synchronous training uses one prompt group per update")
     if attn_backend not in {"native", "flash"}:
         raise ValueError("attn_backend must be native or flash")
     if not math.isfinite(learning_rate) or learning_rate <= 0:
@@ -117,6 +119,7 @@ def run_training(*, model_path: str, data_path: Path, output: Path, mode: str = 
     policy = AsyncPolicyConfig(max_steps=steps, max_policy_lag=lag, queue_capacity=queue_capacity,
                                max_inflight_rollouts=max_inflight_rollouts,
                                weight_sync_interval_updates=weight_sync_interval_updates,
+                               rollout_batch_groups=rollout_batch_groups,
                                operation_timeout_s=300, shutdown_timeout_s=30)
     output.mkdir(parents=True, exist_ok=True)
     if any((output / name).exists() for name in ("result.json", "updates.jsonl", "samples.jsonl")):
@@ -126,7 +129,8 @@ def run_training(*, model_path: str, data_path: Path, output: Path, mode: str = 
     configure_chat_template_enable_thinking(tokenizer, False)
     prompts = load_prompts(data_path, tokenizer)
     config = CudaConfig(devices=[0], rollout_devices=[1], tp_size=1, dp_size=1, rollout_tp_size=1,
-                        max_running_prompts=n_samples, lora=LoraConfig(rank=lora_rank, alpha=lora_alpha),
+                        max_running_prompts=n_samples * rollout_batch_groups,
+                        lora=LoraConfig(rank=lora_rank, alpha=lora_alpha),
                         policy_sync_bucket_mb=8, base_model_name_or_path=base_model_reference or model_path,
                         optimizer={"lr": learning_rate, "grad_clip_norm": 1.0},
                         runtime={"compile_model": False, "eager_decode": True, "attn_backend": attn_backend})
@@ -256,11 +260,17 @@ def parse_args(argv=None):
     parser.add_argument("--queue-capacity", type=positive_int, default=2)
     parser.add_argument("--max-inflight-rollouts", type=positive_int, default=1)
     parser.add_argument("--weight-sync-interval-updates", type=positive_int, default=1)
+    parser.add_argument("--rollout-batch-groups", type=positive_int, default=1,
+                        help="Prompt groups per native session; opt-in and bounded by max-inflight-rollouts")
     parser.add_argument("--save-training-state", action="store_true", help="Include optimizer and train RNG state")
     parser.add_argument("--resume-from", help="Resume a training-state checkpoint; the prompt iterator starts afresh")
     args = parser.parse_args(argv)
     if args.lag < 0:
         parser.error("--lag must be nonnegative")
+    if args.rollout_batch_groups > args.max_inflight_rollouts:
+        parser.error("--rollout-batch-groups cannot exceed --max-inflight-rollouts")
+    if args.mode == "sync" and args.rollout_batch_groups != 1:
+        parser.error("--mode sync requires --rollout-batch-groups 1")
     return args
 
 
@@ -278,7 +288,8 @@ def main(argv=None) -> int:
                           lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, learning_rate=args.learning_rate,
                           n_samples=args.n_samples, max_new_tokens=args.max_new_tokens, loss=args.loss,
                           queue_capacity=args.queue_capacity, max_inflight_rollouts=args.max_inflight_rollouts,
-                          weight_sync_interval_updates=args.weight_sync_interval_updates)
+                          weight_sync_interval_updates=args.weight_sync_interval_updates,
+                          rollout_batch_groups=args.rollout_batch_groups)
     print(json.dumps({"ok": result["ok"], "output": str(args.output_dir)}))
     return 0 if result["ok"] else 1
 

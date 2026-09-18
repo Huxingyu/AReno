@@ -172,6 +172,12 @@ class NativeCudaEnginePair:
         return _wait_handles([self._clusters[role].submit(op, payload)], deadline, self._stop_event)[0]
 
     def generate(self, prompt: AsyncPrompt, version: int, *, timeout_s: float | None) -> RolloutResult:
+        return self.generate_batch((prompt,), version, timeout_s=timeout_s)[0]
+
+    def generate_batch(
+        self, prompts: tuple[AsyncPrompt, ...], version: int, *, timeout_s: float | None,
+    ) -> dict[int, RolloutResult]:
+        """Expand groups to stable worker rows and restore each group by input position."""
         from areno.api.backend.cuda.generation import rollout_options
         from areno.api.models import RolloutResult, RolloutSequence
         from areno.engine.protocol import Op, RolloutPayload
@@ -179,20 +185,23 @@ class NativeCudaEnginePair:
         deadline = Deadline(timeout_s)
         self._require_ready()
         params = self.sampling_params
-        if prompt.record.get("features") is not None:
-            raise ValueError("native async adapters currently accept text-only prompts")
-        if params.max_prompt_len is not None and len(prompt.input_tokens) > params.max_prompt_len:
-            raise ValueError("prompt exceeds the configured semantic token limit")
+        if not prompts:
+            raise ValueError("a native rollout session requires at least one prompt group")
+        for prompt in prompts:
+            if prompt.record.get("features") is not None:
+                raise ValueError("native async adapters currently accept text-only prompts")
+            if params.max_prompt_len is not None and len(prompt.input_tokens) > params.max_prompt_len:
+                raise ValueError("prompt exceeds the configured semantic token limit")
         options = rollout_options(self._context, params)
         options["sampling_params"].seed = params.seed if params.seed is not None else self.seed
-        capacity = min(self.n_samples, self.config.max_running_prompts)
-        prompt_capacity = max(len(prompt.input_tokens), int(options["max_prompt_len"] or 0))
+        rows = [list(prompt.input_tokens) for prompt in prompts for _ in range(self.n_samples)]
+        capacity = min(len(rows), self.config.max_running_prompts)
+        prompt_capacity = max(max(map(len, rows)), int(options["max_prompt_len"] or 0))
         cache_len = prompt_capacity + params.max_new_tokens
         block_size = self._clusters["rollout"].config.runtime.kv_block_size
         blocks = (cache_len + block_size - 1) // block_size
-        rows = [list(prompt.input_tokens) for _ in range(self.n_samples)]
         payload = RolloutPayload(
-            prompts_by_dp=[rows], prompt_indices_by_dp=[list(range(self.n_samples))], prompt_features_by_dp=None,
+            prompts_by_dp=[rows], prompt_indices_by_dp=[list(range(len(rows)))], prompt_features_by_dp=None,
             max_new_tokens=params.max_new_tokens, eos_token_id=options["eos_token_id"],
             sampling_params=options["sampling_params"], max_running_seqs=capacity, max_cache_len=cache_len,
             max_blocks_per_seq=blocks, max_prefill_tokens=capacity * prompt_capacity,
@@ -203,14 +212,19 @@ class NativeCudaEnginePair:
         self._call("rollout", Op.ROLLOUT_SESSION_END, None, deadline)
         if result.adapter_version is not None and result.adapter_version != version:
             raise RuntimeError("native rollout weights disagree with bridge version")
-        if len(result.response_ids) != self.n_samples:
-            raise RuntimeError("native rollout returned an incomplete prompt group")
-        return RolloutResult(adapter_version=result.adapter_version, sequences=[
-            RolloutSequence(
-                resp_tokens=list(tokens), resp_logprobs=result.logprobs[index, :len(tokens)].tolist(),
-                routed_experts=None if result.routed_experts is None else result.routed_experts[index],
-            ) for index, tokens in enumerate(result.response_ids)
-        ])
+        if len(result.response_ids) != len(rows):
+            raise RuntimeError("native rollout returned incomplete prompt groups")
+        # The TP=1 worker restores state-row order before returning RolloutOutput;
+        # completion order and prompt text must never be used as group identity.
+        if result.prompt_ids != rows:
+            raise RuntimeError("native rollout prompt rows disagree with the requested order")
+        sequences = [RolloutSequence(
+            resp_tokens=list(tokens), resp_logprobs=result.logprobs[index, :len(tokens)].tolist(),
+            routed_experts=None if result.routed_experts is None else result.routed_experts[index],
+        ) for index, tokens in enumerate(result.response_ids)]
+        return {index: RolloutResult(adapter_version=result.adapter_version,
+                                     sequences=sequences[index * self.n_samples:(index + 1) * self.n_samples])
+                for index in range(len(prompts))}
 
     def train(self, batch: BatchEnvelope, version: int, *, timeout_s: float | None) -> bool:
         from areno.api.backend.cuda.training import make_train_pack
@@ -344,6 +358,9 @@ class _NativeRollout:
 
     def generate(self, prompt, version, *, timeout_s):
         return self.pair.generate(prompt, version, timeout_s=timeout_s)
+
+    def generate_batch(self, prompts, version, *, timeout_s):
+        return self.pair.generate_batch(prompts, version, timeout_s=timeout_s)
 
     def close(self, *, timeout_s):
         # The train endpoint owns both process clusters and their TCPStore.

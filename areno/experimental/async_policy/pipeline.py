@@ -7,6 +7,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .bridge import DualEngineBridge
@@ -20,6 +21,7 @@ from .contracts import (
     PipelineClosed,
     PipelineReport,
     RolloutEngine,
+    RolloutSession,
     ShutdownTimeout,
     SyncMetric,
     TrainEngine,
@@ -29,6 +31,7 @@ from .coordination import (
     BoundedReadyQueue,
     Deadline,
     InflightLimiter,
+    LagBudgetLimiter,
     PolicyPipelineCoordinator,
     QueueEmpty,
     QueueFinished,
@@ -37,6 +40,12 @@ from .data import build_batch_envelope, score_prompt_group, snapshot_prompt
 
 if TYPE_CHECKING:
     from areno.api.rewards import RewardRecord
+
+
+@dataclass(frozen=True)
+class _ReadyBatch:
+    batch: BatchEnvelope
+    lag_budget_token: int
 
 
 class AsyncPolicyPipeline:
@@ -58,10 +67,17 @@ class AsyncPolicyPipeline:
         )
         self._coordinator = self._bridge.coordinator
         self._supervisor = self._bridge.supervisor
-        self._queue: BoundedReadyQueue[BatchEnvelope] = BoundedReadyQueue(config.queue_capacity)
+        self._queue: BoundedReadyQueue[_ReadyBatch] = BoundedReadyQueue(config.queue_capacity)
         self._inflight = InflightLimiter(config.max_inflight_rollouts)
+        # Preserve the established speculative single-group scheduler. The
+        # extra budget is needed only when one session creates multiple update
+        # boundaries at once and can otherwise refill the queue with work that
+        # is guaranteed to expire.
+        lag_budget = config.max_policy_lag if config.rollout_batch_groups > 1 else None
+        self._lag_budget = LagBudgetLimiter(self._coordinator, lag_budget)
         self._supervisor.add_stop_hook(self._queue.abort)
         self._supervisor.add_stop_hook(self._inflight.close)
+        self._supervisor.add_stop_hook(self._lag_budget.close)
         self._producer: threading.Thread | None = None
         self._close_lock = threading.Lock()
         self._metrics_lock = threading.Lock()
@@ -89,26 +105,52 @@ class AsyncPolicyPipeline:
     def abort(self) -> None:
         self._supervisor.stop("aborted")
 
-    def _production_task(self, prompt: AsyncPrompt, batch_id: str) -> None:
+    def _publish_group(
+        self, prompt: AsyncPrompt, session: RolloutSession, batch_id: str, lag_budget_token: int,
+    ) -> None:
+        self._lag_budget.bind(lag_budget_token, session.policy_version)
+        rewards = score_prompt_group(
+            prompt, session.result, self._reward_fn, decode=self._decode,
+            check_running=self._supervisor.check_running,
+        )
+        batch = build_batch_envelope(
+            run_id=self._run_id, batch_id=batch_id, epoch=0, policy_version=session.policy_version,
+            prompt_items=[prompt], rollout_results=[session.result], rewards=rewards,
+            eos_token_id=self._eos_token_id,
+        )
+        self._supervisor.check_running()
+        self._queue.put(_ReadyBatch(batch, lag_budget_token))
+
+    def _production_task(self, prompt: AsyncPrompt, batch_id: str, lag_budget_token: int) -> None:
+        published = False
         try:
             self._supervisor.check_running()
-            session = self._bridge.rollout_session(prompt)
-            rewards = score_prompt_group(
-                prompt, session.result, self._reward_fn, decode=self._decode,
-                check_running=self._supervisor.check_running,
-            )
-            batch = build_batch_envelope(
-                run_id=self._run_id, batch_id=batch_id, epoch=0, policy_version=session.policy_version,
-                prompt_items=[prompt], rollout_results=[session.result], rewards=rewards,
-                eos_token_id=self._eos_token_id,
-            )
-            self._supervisor.check_running()
-            self._queue.put(batch)
+            self._publish_group(prompt, self._bridge.rollout_session(prompt), batch_id, lag_budget_token)
+            published = True
         except BaseException as exc:
             if not isinstance(exc, PipelineClosed) or not self.stop_event.is_set():
                 self._supervisor.fail(exc)
         finally:
+            if not published:
+                self._lag_budget.release(lag_budget_token)
             self._inflight.release()
+
+    def _production_batch_task(self, groups: tuple[tuple[AsyncPrompt, str, int], ...]) -> None:
+        unpublished = {lag_budget_token for _, _, lag_budget_token in groups}
+        try:
+            self._supervisor.check_running()
+            sessions = self._bridge.rollout_sessions(tuple(prompt for prompt, _, _ in groups))
+            for (prompt, batch_id, lag_budget_token), session in zip(groups, sessions, strict=True):
+                self._publish_group(prompt, session, batch_id, lag_budget_token)
+                unpublished.remove(lag_budget_token)
+        except BaseException as exc:
+            if not isinstance(exc, PipelineClosed) or not self.stop_event.is_set():
+                self._supervisor.fail(exc)
+        finally:
+            for lag_budget_token in unpublished:
+                self._lag_budget.release(lag_budget_token)
+            for _ in groups:
+                self._inflight.release()
 
     def _produce(self) -> None:
         executor = None
@@ -121,25 +163,53 @@ class AsyncPolicyPipeline:
             index = 0
             while not self.stop_event.is_set():
                 self._inflight.acquire()
+                permits = 1
+                lag_budget_tokens = []
                 submitted = False
                 try:
+                    lag_budget_tokens.append(self._lag_budget.reserve())
                     self._supervisor.check_running()
                     if iterator is None:
                         iterator = iter(self._source)
-                    try:
-                        prompt = next(iterator)
-                    except StopIteration:
-                        exhausted = True
+                    groups = []
+                    for group_index in range(self._config.rollout_batch_groups):
+                        if group_index:
+                            if not self._inflight.try_acquire():
+                                break
+                            permits += 1
+                            lag_budget_token = self._lag_budget.try_reserve()
+                            if lag_budget_token is None:
+                                self._inflight.release()
+                                permits -= 1
+                                break
+                            lag_budget_tokens.append(lag_budget_token)
+                        try:
+                            prompt = next(iterator)
+                        except StopIteration:
+                            exhausted = True
+                            self._lag_budget.release(lag_budget_tokens.pop())
+                            self._inflight.release()
+                            permits -= 1
+                            break
+                        groups.append((snapshot_prompt(prompt), f"{self._run_id}:{index}", lag_budget_tokens[-1]))
+                        index += 1
+                    if not groups:
                         break
-                    owned_prompt = snapshot_prompt(prompt)
                     self._supervisor.check_running()
                     # At most K futures exist: a permit spans read, submit, work and put.
-                    executor.submit(self._production_task, owned_prompt, f"{self._run_id}:{index}")
+                    if self._config.rollout_batch_groups == 1:
+                        executor.submit(self._production_task, *groups[0])
+                    else:
+                        executor.submit(self._production_batch_task, tuple(groups))
                     submitted = True
-                    index += 1
                 finally:
                     if not submitted:
-                        self._inflight.release()
+                        for lag_budget_token in lag_budget_tokens:
+                            self._lag_budget.release(lag_budget_token)
+                        for _ in range(permits):
+                            self._inflight.release()
+                if exhausted:
+                    break
         except BaseException as exc:
             if not isinstance(exc, PipelineClosed) or not self.stop_event.is_set():
                 self._supervisor.fail(exc)
@@ -162,6 +232,7 @@ class AsyncPolicyPipeline:
         if metric is not None:
             with self._metrics_lock:
                 self._sync_metrics.append(metric)
+            self._lag_budget.notify_version_change()
 
     def _record_terminal_batch(self, batch: BatchEnvelope, decision: str, wait_s: float = 0.0) -> None:
         state = self._coordinator.snapshot()
@@ -183,7 +254,7 @@ class AsyncPolicyPipeline:
             start = time.monotonic()
             try:
                 try:
-                    batch = self._queue.get(timeout_s=self._config.poll_interval_s)
+                    ready = self._queue.get(timeout_s=self._config.poll_interval_s)
                 finally:
                     elapsed = time.monotonic() - start
                     wait_s += elapsed
@@ -195,15 +266,19 @@ class AsyncPolicyPipeline:
                 self._record_sync(self._bridge.sync())
                 self._supervisor.stop("data_exhausted")
                 break
+            batch = ready.batch
             with self._metrics_lock:
                 self._batches_seen += 1
             try:
-                result = self._bridge.train(batch)
-            except BaseException:
-                decision = "failed" if self._supervisor.failure is not None else "cancelled"
-                self._record_terminal_batch(batch, decision, wait_s)
-                wait_s = 0.0
-                raise
+                try:
+                    result = self._bridge.train(batch)
+                except BaseException:
+                    decision = "failed" if self._supervisor.failure is not None else "cancelled"
+                    self._record_terminal_batch(batch, decision, wait_s)
+                    wait_s = 0.0
+                    raise
+            finally:
+                self._lag_budget.release(ready.lag_budget_token)
             admission = result.admission
             with self._metrics_lock:
                 self._batch_metrics.append(BatchMetric(
@@ -237,8 +312,9 @@ class AsyncPolicyPipeline:
                 self.close()
             except BaseException as exc:
                 self._supervisor.fail(exc)
-            for batch in self._queue.discard_pending():
-                self._record_terminal_batch(batch, "cancelled")
+            for ready in self._queue.discard_pending():
+                self._record_terminal_batch(ready.batch, "cancelled")
+                self._lag_budget.release(ready.lag_budget_token)
         if self._supervisor.failure is not None:
             raise self._supervisor.failure
         return self.report()

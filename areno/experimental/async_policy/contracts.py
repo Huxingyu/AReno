@@ -48,9 +48,12 @@ class AsyncPolicyConfig:
     """Bounds for one completion pipeline (all versions count optimizer steps).
 
     ``queue_capacity`` (Q) counts ready prompt-group batches, default 2.
-    ``max_inflight_rollouts`` (K) counts production tasks from source read
+    ``max_inflight_rollouts`` (K) counts prompt groups from source read
     through generation, CPU scoring and publication, default 1; GPU sessions
-    still serialize. ``weight_sync_interval_updates`` (C), default 1, counts
+    still serialize. ``rollout_batch_groups``, default 1, optionally packs up
+    to that many groups into one session and cannot exceed K. Every group
+    retains a permit and its own scoring and optimizer-update boundary.
+    ``weight_sync_interval_updates`` (C), default 1, counts
     actual optimizer updates since the last weight copy. Lag can force an
     earlier copy: sync is due at ``min(C, max_policy_lag + 1)`` updates.
 
@@ -73,12 +76,15 @@ class AsyncPolicyConfig:
     operation_timeout_s: float = 60.0
     shutdown_timeout_s: float = 60.0
     poll_interval_s: float = 0.05
+    rollout_batch_groups: int = 1
 
     def __post_init__(self) -> None:
-        for name in ("queue_capacity", "max_inflight_rollouts", "weight_sync_interval_updates"):
+        for name in ("queue_capacity", "max_inflight_rollouts", "weight_sync_interval_updates", "rollout_batch_groups"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.rollout_batch_groups > self.max_inflight_rollouts:
+            raise ValueError("rollout_batch_groups cannot exceed max_inflight_rollouts")
         for name in ("max_policy_lag", "max_steps"):
             value = getattr(self, name)
             if name == "max_steps" and value is None:
@@ -202,6 +208,14 @@ class RolloutEngine(Protocol):
     def generate(self, prompt: AsyncPrompt, version: int, *, timeout_s: float | None) -> RolloutResult: ...
 
     def close(self, *, timeout_s: float | None) -> None: ...
+
+
+class BatchedRolloutEngine(RolloutEngine, Protocol):
+    def generate_batch(
+        self, prompts: tuple[AsyncPrompt, ...], version: int, *, timeout_s: float | None,
+    ) -> dict[int, RolloutResult]:
+        """Return every group by its input position; dictionary order is irrelevant."""
+        ...
 
 
 class TrainEngine(Protocol):

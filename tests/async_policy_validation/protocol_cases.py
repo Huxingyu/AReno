@@ -56,6 +56,7 @@ def save(name, value):
 def assert_drained(pipe):
     assert not pipe.producer_alive
     assert pipe.inflight_active == 0, f"leaked permits: {pipe.inflight_active}"
+    assert pipe._lag_budget.active == 0, f"leaked lag budget: {pipe._lag_budget.active}"
     assert pipe._coordinator.active_rollouts == 0
     assert not pipe._coordinator.train_active
     assert not pipe._coordinator.sync_active

@@ -126,7 +126,10 @@ Run ``python examples/async_policy/train.py --help`` for the command-line syntax
      - Ready prompt-group batches (Q).
    * - ``--max-inflight-rollouts``
      - 1
-     - Production tasks (K), including CPU scoring and publication.
+     - Prompt groups (K), including CPU scoring and publication.
+   * - ``--rollout-batch-groups``
+     - 1
+     - Groups per native generation session; at most K, async mode only.
    * - ``--weight-sync-interval-updates``
      - 1
      - Maximum updates between weight copies (C); lag can force earlier copies.
@@ -161,6 +164,15 @@ the fixed 128-question holdout. The original 32 questions remain its first subse
 seeds. ``--suite capacity`` covers Q in 1/2/4, K in 1/2 and C in 1/2/4, with
 three seeds and lag=4 so the cadence settings remain distinct. ``--suite gspo``
 plans a separate GSPO comparison. These plans do not imply measured improvements.
+
+``--suite batching`` plans three seeds with eight samples and 256-token outputs.
+It holds Q=2, K=2, C=1 and lag=1 fixed, comparing one versus two groups per
+async generation session, with a serial control for each seed. Its
+``batching_comparisons`` match the same async settings and include both raw
+metric sets. Each group remains a separate optimizer update. In the training
+example, ``--max-inflight-rollouts 2 --rollout-batch-groups 2`` opts into this
+path and permits up to ``2 * n_samples`` active rollout rows. The default remains
+one group per session.
 
 After execution, ``benchmark-summary.json`` reports completed and missing jobs,
 per-seed accuracy, response lengths, token-limit hit rates, and comparisons

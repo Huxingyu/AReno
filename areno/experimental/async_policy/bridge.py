@@ -8,6 +8,7 @@ import time
 from .contracts import (
     AsyncPolicyConfig,
     AsyncPrompt,
+    BatchContractError,
     BatchEnvelope,
     DeviceMode,
     Lifecycle,
@@ -36,6 +37,8 @@ class DualEngineBridge:
         if mode == DeviceMode.ASYNC and set(train_devices).intersection(rollout_devices):
             raise ValueError("ASYNC mode requires disjoint model devices")
         self.config = config or AsyncPolicyConfig()
+        if self.config.rollout_batch_groups > 1 and not callable(getattr(rollout_engine, "generate_batch", None)):
+            raise TypeError("rollout_batch_groups > 1 requires a generate_batch adapter")
         self.coordinator = coordinator or PolicyPipelineCoordinator()
         self.coordinator.attach(self.config, mode)
         self.supervisor = Supervisor()
@@ -80,6 +83,37 @@ class DualEngineBridge:
             result = self._rollout_engine.generate(prompt, version, timeout_s=deadline.remaining())
             # Snapshot before releasing the session: a later generate may reuse its buffers.
             return RolloutSession(version, snapshot_rollout(result, version))
+        except BaseException as exc:
+            if not isinstance(exc, PipelineClosed) or not self.supervisor.stop_event.is_set():
+                self.supervisor.fail(exc)
+            raise
+        finally:
+            if admitted:
+                self.coordinator.end_rollout()
+
+    def rollout_sessions(
+        self, prompts: tuple[AsyncPrompt, ...], *, timeout_s: float | None = None,
+    ) -> tuple[RolloutSession, ...]:
+        """Generate complete groups under one lease and one policy version."""
+        self.supervisor.check_model_use()
+        if not 0 < len(prompts) <= self.config.rollout_batch_groups:
+            raise ValueError("session group count exceeds rollout_batch_groups or is empty")
+        generate = getattr(self._rollout_engine, "generate_batch", None)
+        if not callable(generate):
+            raise TypeError("batched sessions require a generate_batch adapter")
+        deadline = Deadline(self.config.operation_timeout_s if timeout_s is None else timeout_s)
+        admitted = False
+        try:
+            version = self.coordinator.begin_rollout(timeout_s=deadline.remaining())
+            admitted = True
+            deadline.check()
+            results = generate(prompts, version, timeout_s=deadline.remaining())
+            if (not isinstance(results, dict) or any(type(index) is not int for index in results)
+                    or set(results) != set(range(len(prompts)))):
+                raise BatchContractError("generate_batch must return every input group exactly once by position")
+            # Validate and own every result before releasing buffers or publishing a group.
+            return tuple(RolloutSession(version, snapshot_rollout(results[index], version))
+                         for index in range(len(prompts)))
         except BaseException as exc:
             if not isinstance(exc, PipelineClosed) or not self.supervisor.stop_event.is_set():
                 self.supervisor.fail(exc)

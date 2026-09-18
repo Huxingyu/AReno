@@ -44,6 +44,11 @@ def build_jobs(args) -> list[dict]:
     elif args.suite == "throughput":
         configurations = [(limit, samples, 2, 1, 1, 1) for limit, samples in itertools.product((256, 512), (4, 8))]
         cases = ["sync", "lag1"]
+    elif args.suite == "batching":
+        # C=2 lets two grouped updates share one weight copy; C=1 forces a sync
+        # after each group, which serializes the generation gain away.
+        configurations = [(256, 8, 2, 2, 1, 1), (256, 8, 2, 2, 2, 1)]
+        cases = ["sync", "lag1"]
     else:
         # Lag=1 would force C=4 to sync after two updates, confounding the scan.
         configurations = [(64, 4, q, k, c, 4) for q, k, c in itertools.product((1, 2, 4), (1, 2), (1, 2, 4))]
@@ -54,12 +59,22 @@ def build_jobs(args) -> list[dict]:
         jobs.append({"name": name, "seed": seed, "max_new_tokens": limit, "n_samples": samples,
                      "queue_capacity": q, "max_inflight_rollouts": k, "weight_sync_interval_updates": c,
                      "lag": lag, "cases": cases})
+    if args.suite == "batching":
+        paired = []
+        for job in jobs:
+            # The synchronous control ignores C, so it is only paired with C=1.
+            cases = ["lag1"] if job["weight_sync_interval_updates"] != 1 else job["cases"]
+            single = {**job, "name": job["name"] + "-g1", "rollout_batch_groups": 1, "cases": cases}
+            batched = {**job, "name": job["name"] + "-g2", "rollout_batch_groups": 2, "cases": ["lag1"]}
+            paired.extend([single, batched] if job["seed"] % 2 else [batched, single])
+        jobs = paired
     if args.suite == "capacity":
         jobs.extend({"name": f"seed{seed}-sync", "seed": seed, "max_new_tokens": 64, "n_samples": 4,
                      "queue_capacity": 2, "max_inflight_rollouts": 1, "weight_sync_interval_updates": 1,
                      "lag": 4, "cases": ["sync"]} for seed in seeds)
     individual = []
     for job in jobs:
+        job.setdefault("rollout_batch_groups", 1)
         job.update(steps=args.steps, warmup=args.warmup, attn_backend=args.attn_backend,
                    loss="gspo" if args.suite == "gspo" else "grpo",
                    lora_rank=getattr(args, "lora_rank", 8), lora_alpha=getattr(args, "lora_alpha", 16.0),
@@ -81,7 +96,8 @@ def expected_settings(job: dict) -> dict:
             "weight_sync_interval_updates")
     return {**{key: job[key] for key in keys}, "mode": "sync" if case == "sync" else "async",
             "lag": 0 if case == "lag0" else job["lag"],
-            "loss": "grpo-offpolicy" if case == "offpolicy" else job["loss"]}
+            "loss": "grpo-offpolicy" if case == "offpolicy" else job["loss"],
+            "rollout_batch_groups": job.get("rollout_batch_groups", 1)}
 
 
 def distribution(values: list[float]) -> dict:
@@ -110,6 +126,30 @@ def completed_attempt(stage: Path, identity: dict | None = None) -> Path | None:
 def stage_result(attempt: Path, stage: str) -> dict:
     name = "training-result.json" if stage == "train" else "result.json"
     return json.loads((attempt / "artifacts" / name).read_text())
+
+
+def batching_comparisons(rows: list[dict]) -> dict:
+    """Compare session packing at fixed async scheduling, including K and lag."""
+    def key(row):
+        return fingerprint({name: value for name, value in row["training_settings"].items()
+                            if name != "rollout_batch_groups"})
+
+    controls = {key(row): row for row in rows if row["training_settings"].get("rollout_batch_groups", 1) == 1}
+    paired, missing = [], []
+    for row in rows:
+        if row["training_settings"].get("rollout_batch_groups", 1) == 1:
+            continue
+        control = controls.get(key(row))
+        if control is None:
+            missing.append({"seed": row["seed"], "settings": row["training_settings"]})
+            continue
+        paired.append({"seed": row["seed"], "settings": row["training_settings"],
+                       "single_group_metrics": control["metrics"], "batched_metrics": row["metrics"],
+                       "updates_per_s_ratio": row["metrics"]["updates_per_s"] / control["metrics"]["updates_per_s"],
+                       "accuracy_delta_by_eval_limit": {
+                           limit: score["after"]["accuracy"] - control["evaluations"][limit]["after"]["accuracy"]
+                           for limit, score in row["evaluations"].items()}})
+    return {"paired": paired, "missing_single_group_baselines": missing}
 
 
 def summarize(jobs: list[dict], output: Path) -> dict:
@@ -157,6 +197,8 @@ def summarize(jobs: list[dict], output: Path) -> dict:
             for setting in ("queue_capacity", "max_inflight_rollouts", "weight_sync_interval_updates"):
                 if row["policy"][setting] != job[setting]:
                     raise ValueError(f"benchmark {setting} does not match the manifest: {path}")
+            if row["policy"].get("rollout_batch_groups", 1) != job.get("rollout_batch_groups", 1):
+                raise ValueError(f"benchmark rollout_batch_groups does not match the manifest: {path}")
         rows.extend(result["cases"])
     for field in ("training_code_sha256", "evaluator_sha256", "model_sha256", "environment", "evaluation_environment"):
         if len({json.dumps(row[field], sort_keys=True) for row in rows}) > 1:
@@ -182,7 +224,7 @@ def summarize(jobs: list[dict], output: Path) -> dict:
         policy = row["policy"]
         key = (row["case"], row["loss"], row["train_max_new_tokens"], row["n_samples"], row["lag"],
                policy["queue_capacity"], policy["max_inflight_rollouts"], policy["weight_sync_interval_updates"],
-               row["attn_backend"])
+               row["attn_backend"], policy.get("rollout_batch_groups", 1))
         groups[key].append(row)
     aggregate, missing_baselines = [], []
     for key, values in sorted(groups.items()):
@@ -203,7 +245,8 @@ def summarize(jobs: list[dict], output: Path) -> dict:
                                for limit, score in row["evaluations"].items()}})
         aggregate.append({"configuration": dict(zip(("case", "loss", "train_max_new_tokens", "n_samples", "lag",
                                                      "queue_capacity", "max_inflight_rollouts",
-                                                     "weight_sync_interval_updates", "attn_backend"), key, strict=True)),
+                                                     "weight_sync_interval_updates", "attn_backend",
+                                                     "rollout_batch_groups"), key, strict=True)),
                           "seeds": sorted(row["seed"] for row in values), "paired_with_sync": paired,
                           "paired_updates_per_s_ratio": distribution([row["updates_per_s_ratio"] for row in paired]) if paired else None,
                           "paired_accuracy_delta": {
@@ -217,7 +260,9 @@ def summarize(jobs: list[dict], output: Path) -> dict:
                               "mean_token_limit_hit_rate": statistics.mean(row["evaluations"][limit]["after"]["token_limit_hit_rate"] for row in values),
                               "mean_response_tokens": statistics.mean(row["evaluations"][limit]["after"]["mean_response_tokens"] for row in values),
                           } for limit in values[0]["evaluations"]}})
-    return {"complete": not missing and not missing_baselines, "missing_jobs": missing,
+    batching = batching_comparisons(rows)
+    return {"complete": not missing and not missing_baselines and not batching["missing_single_group_baselines"],
+            "missing_jobs": missing, "batching_comparisons": batching,
             "failed_or_interrupted_attempts": failures, "missing_sync_baselines": missing_baselines,
             "expected_jobs": len(jobs),
             "completed_jobs": len(jobs) - len(missing), "groups": aggregate,
@@ -258,6 +303,7 @@ def benchmark_arguments(job: dict) -> list[str]:
                 "lora_rank", "lora_alpha", "learning_rate"):
         command.extend(["--" + key.replace("_", "-"), str(job[key])])
     command.extend(["--cases", *job["cases"]])
+    command.extend(["--rollout-batch-groups", str(job.get("rollout_batch_groups", 1))])
     return command
 
 
@@ -368,7 +414,7 @@ def execute(args, jobs: list[dict], manifest: dict) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=("quality", "throughput", "capacity", "gspo"), required=True)
+    parser.add_argument("--suite", choices=("quality", "throughput", "capacity", "gspo", "batching"), required=True)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seeds", type=int, nargs="+")
