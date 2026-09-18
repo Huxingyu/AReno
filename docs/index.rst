@@ -41,6 +41,7 @@ AReno documentation
 
    cookbook/writing-loaders-and-rewards
    cookbook/math-rlvr
+   cookbook/async-grpo-two-gpu
    cookbook/tictactoe-agentic-rl
    cookbook/duelgrid-visual-agent
 
