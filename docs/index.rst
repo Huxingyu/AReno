@@ -25,6 +25,7 @@ AReno documentation
 
    Training Loop <concepts/training-loop>
    Backend Topology <concepts/backend-topology>
+   Experimental Async Policy <concepts/async-policy>
    Chat Templates <concepts/chat-templates>
    Dataset Formats <concepts/dataset-formats>
    Multimodal Inputs <concepts/multimodal-inputs>
